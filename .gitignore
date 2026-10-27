@@ -1,0 +1,73 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+.turbo/
+
+# Environment files (never commit real secrets)
+.env
+.env.local
+.env.*.local
+
+# Supabase local
+supabase/.branches/
+supabase/.temp/
+
+# .NET / C#
+.dotnet/
+[Bb]in/
+[Oo]bj/
+**/[Bb]in/
+**/[Oo]bj/
+**/publish/
+agent/packages/
+*.user
+*.suo
+.vs/
+TestResults/
+**/*.nupkg
+**/*.snupkg
+
+# Installer output
+installer/Output/
+installer/*.exe
+!installer/ScriptRunner.iss
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Logs & Temp files
+*.log
+logs/
+agent_stdout.txt
+err.txt
+out.txt
+*.tmp
+
+# Coverage & Tests
+coverage/
+lcov.info
+tests/db/
+dashboard/test_assets/
+dashboard/data/packages/
+dashboard/data/rmm/
+
+# Binaries & Published Executables
+/appsettings.json
+ScriptRunnerAgent.exe
+agent/publish/
+agent/bin/
+agent/obj/
+agent/packages/
+*.exe
+!installer/ScriptRunner.iss
+

@@ -1,0 +1,2409 @@
+-- Migration: 009_rmm_core.sql
+-- Description: Remote Monitoring & Management core.
+--
+-- Adds endpoint inventory, time-series telemetry, monitor definitions/results,
+-- alerting, Windows event ingestion, software inventory, package management,
+-- deployment policies/jobs, device groups and health scoring.
+--
+-- Design notes:
+--  * All organisation-scoped tables carry organization_id and are protected by
+--    RLS. The Windows agent never talks to PostgREST directly; it authenticates
+--    through the agent-gateway Edge Function, which validates the device JWT and
+--    calls the SECURITY DEFINER RPCs below with the service role.
+--  * Telemetry rows are append-only. Growth is controlled by batched ingestion
+--    (bounded payloads), BRIN + btree indexes and rmm_apply_retention().
+--  * Agent-reported values are untrusted: every JSON payload is size-checked,
+--    typed, truncated and rejected when malformed.
+--  * Deployment jobs are persisted before dispatch and claimed atomically, so a
+--    reconnect cannot execute the same package twice.
+
+-- ============================================================
+-- TYPES
+-- ============================================================
+CREATE TYPE device_group_type AS ENUM ('static', 'dynamic');
+CREATE TYPE monitor_kind AS ENUM (
+    'cpu', 'memory', 'disk', 'process', 'service', 'event_log', 'file',
+    'directory', 'registry', 'powershell', 'ping', 'tcp', 'hardware', 'os',
+    'custom_metric'
+);
+CREATE TYPE monitor_status AS ENUM ('ok', 'warning', 'critical', 'unknown', 'error');
+CREATE TYPE monitor_severity AS ENUM ('info', 'warning', 'critical');
+CREATE TYPE alert_status AS ENUM ('open', 'acknowledged', 'resolved');
+CREATE TYPE software_change_type AS ENUM ('installed', 'updated', 'removed', 'detected');
+CREATE TYPE package_format AS ENUM ('msi', 'exe');
+CREATE TYPE package_approval_status AS ENUM ('draft', 'pending', 'approved', 'rejected');
+CREATE TYPE deployment_target_type AS ENUM ('device', 'group');
+CREATE TYPE deployment_operation AS ENUM ('install', 'update', 'repair', 'uninstall', 'rollback');
+CREATE TYPE deployment_state AS ENUM (
+    'pending', 'queued', 'downloading', 'validating', 'installing', 'verifying',
+    'succeeded', 'failed', 'cancelled', 'expired', 'reboot_required', 'blocked'
+);
+
+-- ============================================================
+-- AGENT HEALTH / CHECK-IN COLUMNS ON DEVICES
+-- ============================================================
+ALTER TABLE devices
+    ADD COLUMN last_heartbeat_at        TIMESTAMPTZ,
+    ADD COLUMN heartbeat_failures       INT NOT NULL DEFAULT 0 CHECK (heartbeat_failures >= 0),
+    ADD COLUMN reconnect_attempts       INT NOT NULL DEFAULT 0 CHECK (reconnect_attempts >= 0),
+    ADD COLUMN pending_job_count        INT NOT NULL DEFAULT 0 CHECK (pending_job_count >= 0),
+    ADD COLUMN last_metric_at           TIMESTAMPTZ,
+    ADD COLUMN last_inventory_at        TIMESTAMPTZ,
+    ADD COLUMN last_software_scan_at    TIMESTAMPTZ,
+    ADD COLUMN last_event_at            TIMESTAMPTZ,
+    ADD COLUMN agent_update_required    BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN agent_restart_required   BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE INDEX idx_devices_heartbeat ON devices (last_heartbeat_at);
+
+-- ============================================================
+-- ORGANISATION RMM SETTINGS
+-- ============================================================
+ALTER TABLE organization_settings
+    ADD COLUMN offline_after_seconds           INT NOT NULL DEFAULT 300
+        CHECK (offline_after_seconds BETWEEN 60 AND 86400),
+    ADD COLUMN metrics_interval_seconds        INT NOT NULL DEFAULT 60
+        CHECK (metrics_interval_seconds BETWEEN 10 AND 3600),
+    ADD COLUMN inventory_interval_seconds      INT NOT NULL DEFAULT 21600
+        CHECK (inventory_interval_seconds BETWEEN 300 AND 604800),
+    ADD COLUMN software_scan_interval_seconds  INT NOT NULL DEFAULT 21600
+        CHECK (software_scan_interval_seconds BETWEEN 300 AND 604800),
+    ADD COLUMN event_scan_interval_seconds     INT NOT NULL DEFAULT 300
+        CHECK (event_scan_interval_seconds BETWEEN 60 AND 86400),
+    ADD COLUMN metrics_retention_days          INT NOT NULL DEFAULT 30
+        CHECK (metrics_retention_days BETWEEN 1 AND 3650),
+    ADD COLUMN monitor_results_retention_days  INT NOT NULL DEFAULT 30
+        CHECK (monitor_results_retention_days BETWEEN 1 AND 3650),
+    ADD COLUMN event_retention_days            INT NOT NULL DEFAULT 30
+        CHECK (event_retention_days BETWEEN 1 AND 3650),
+    ADD COLUMN deployment_output_retention_days INT NOT NULL DEFAULT 30
+        CHECK (deployment_output_retention_days BETWEEN 1 AND 3650),
+    ADD COLUMN deployment_concurrency_limit    INT NOT NULL DEFAULT 5
+        CHECK (deployment_concurrency_limit BETWEEN 1 AND 100),
+    ADD COLUMN allow_custom_powershell_monitors BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Windows Security log collection is opt-in and must be explicitly
+    -- authorised; the default filters are still applied when enabled.
+    ADD COLUMN allow_security_event_collection BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN allow_service_recovery         BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Minimum seconds between two automated recovery actions for the same
+    -- service on the same device; prevents restart loops.
+    ADD COLUMN service_recovery_cooldown_seconds INT NOT NULL DEFAULT 600
+        CHECK (service_recovery_cooldown_seconds BETWEEN 60 AND 86400),
+    ADD COLUMN max_event_bytes_per_scan        INT NOT NULL DEFAULT 1048576
+        CHECK (max_event_bytes_per_scan BETWEEN 4096 AND 16777216);
+
+-- ============================================================
+-- DEVICE GROUPS
+-- ============================================================
+CREATE TABLE device_groups (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    name            TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 120),
+    description     TEXT CHECK (char_length(description) <= 500),
+    group_type      device_group_type NOT NULL DEFAULT 'static',
+    -- Dynamic rule document, e.g.
+    -- {"match":"all","rules":[{"field":"os","op":"contains","value":"Windows 11"}]}
+    dynamic_rules   JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(dynamic_rules) <= 16384),
+    created_by      UUID REFERENCES auth.users (id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (organization_id, name)
+);
+
+CREATE INDEX idx_device_groups_org ON device_groups (organization_id);
+
+CREATE TABLE device_group_members (
+    group_id    UUID NOT NULL REFERENCES device_groups (id) ON DELETE CASCADE,
+    device_id   UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    added_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (group_id, device_id)
+);
+
+CREATE INDEX idx_group_members_device ON device_group_members (device_id);
+
+CREATE TRIGGER trg_device_groups_updated_at
+    BEFORE UPDATE ON device_groups
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- ============================================================
+-- GENERAL GUARD: device and organisation must match
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_assert_device_org()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM devices d
+        WHERE d.id = NEW.device_id
+          AND d.organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'device % does not belong to organization %',
+            NEW.device_id, NEW.organization_id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+-- Bounded JSON guard used for agent-supplied payloads.
+CREATE OR REPLACE FUNCTION rmm_json_array_size(p_value JSONB)
+RETURNS INT LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE WHEN jsonb_typeof(p_value) = 'array' THEN jsonb_array_length(p_value) ELSE 0 END;
+$$;
+
+-- ============================================================
+-- HARDWARE / OS / NETWORK INVENTORY
+-- ============================================================
+CREATE TABLE device_inventory (
+    device_id       UUID PRIMARY KEY REFERENCES devices (id) ON DELETE CASCADE,
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    hardware        JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(hardware) <= 65536),
+    os              JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(os) <= 32768),
+    network         JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(network) <= 65536),
+    -- Agent-reported quality flags (partial collection, permission denied...)
+    data_quality    JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(data_quality) <= 8192),
+    collected_at    TIMESTAMPTZ NOT NULL,
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_device_inventory_org ON device_inventory (organization_id);
+CREATE TRIGGER trg_inventory_device_org
+    BEFORE INSERT OR UPDATE ON device_inventory
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+CREATE TRIGGER trg_inventory_updated_at
+    BEFORE UPDATE ON device_inventory
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE device_inventory_snapshots (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    device_id       UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    content_hash    TEXT NOT NULL CHECK (char_length(content_hash) = 32),
+    hardware        JSONB NOT NULL DEFAULT '{}'::JSONB CHECK (pg_column_size(hardware) <= 65536),
+    os              JSONB NOT NULL DEFAULT '{}'::JSONB CHECK (pg_column_size(os) <= 32768),
+    network         JSONB NOT NULL DEFAULT '{}'::JSONB CHECK (pg_column_size(network) <= 65536),
+    collected_at    TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_inventory_snapshots_device
+    ON device_inventory_snapshots (device_id, collected_at DESC);
+CREATE TRIGGER trg_inventory_snapshot_org
+    BEFORE INSERT ON device_inventory_snapshots
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+
+-- ============================================================
+-- TIME-SERIES METRICS
+-- ============================================================
+CREATE TABLE device_metrics (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    device_id       UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    metric          TEXT NOT NULL CHECK (char_length(metric) BETWEEN 1 AND 80),
+    value           DOUBLE PRECISION NOT NULL,
+    dimensions      JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(dimensions) <= 2048),
+    collected_at    TIMESTAMPTZ NOT NULL,
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Query path: latest + ranges for one device/metric.
+CREATE INDEX idx_metrics_device_metric
+    ON device_metrics (device_id, metric, collected_at DESC);
+-- Retention sweep / fleet-wide ranges.
+CREATE INDEX idx_metrics_collected_brin ON device_metrics USING BRIN (collected_at);
+CREATE INDEX idx_metrics_org_time ON device_metrics (organization_id, collected_at DESC);
+
+CREATE TRIGGER trg_metrics_device_org
+    BEFORE INSERT ON device_metrics
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+
+-- ============================================================
+-- MONITORS
+-- ============================================================
+CREATE TABLE monitors (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id     UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    name                TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 160),
+    kind                monitor_kind NOT NULL,
+    -- Scope: exactly one of device_id (single endpoint), group_id (group) or
+    -- neither (whole organisation).
+    device_id           UUID REFERENCES devices (id) ON DELETE CASCADE,
+    group_id            UUID REFERENCES device_groups (id) ON DELETE CASCADE,
+    config              JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(config) <= 16384),
+    interval_seconds    INT NOT NULL DEFAULT 60 CHECK (interval_seconds BETWEEN 15 AND 86400),
+    timeout_seconds     INT NOT NULL DEFAULT 30 CHECK (timeout_seconds BETWEEN 1 AND 600),
+    severity            monitor_severity NOT NULL DEFAULT 'warning',
+    -- Number of consecutive breaching samples required before alerting.
+    breach_samples      INT NOT NULL DEFAULT 1 CHECK (breach_samples BETWEEN 1 AND 60),
+    recovery_samples    INT NOT NULL DEFAULT 1 CHECK (recovery_samples BETWEEN 1 AND 60),
+    enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Service recovery is only permitted when the organisation allows it and
+    -- the monitor explicitly opts in.
+    auto_recovery       BOOLEAN NOT NULL DEFAULT FALSE,
+    recovery_action     JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(recovery_action) <= 4096),
+    created_by          UUID REFERENCES auth.users (id),
+    updated_by          UUID REFERENCES auth.users (id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_monitor_single_scope CHECK (NOT (device_id IS NOT NULL AND group_id IS NOT NULL)),
+    CONSTRAINT chk_recovery_kind CHECK (NOT auto_recovery OR kind IN ('service', 'process'))
+);
+
+CREATE INDEX idx_monitors_org ON monitors (organization_id, enabled);
+CREATE INDEX idx_monitors_device ON monitors (device_id) WHERE device_id IS NOT NULL;
+CREATE INDEX idx_monitors_group ON monitors (group_id) WHERE group_id IS NOT NULL;
+
+CREATE TRIGGER trg_monitors_updated_at
+    BEFORE UPDATE ON monitors
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE monitor_state (
+    monitor_id          UUID NOT NULL REFERENCES monitors (id) ON DELETE CASCADE,
+    device_id           UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    last_status         monitor_status NOT NULL DEFAULT 'unknown',
+    consecutive_breaches INT NOT NULL DEFAULT 0,
+    consecutive_oks     INT NOT NULL DEFAULT 0,
+    last_value          DOUBLE PRECISION,
+    last_message        TEXT CHECK (char_length(last_message) <= 2000),
+    last_run_at         TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (monitor_id, device_id)
+);
+
+CREATE TABLE monitor_results (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    monitor_id      UUID NOT NULL REFERENCES monitors (id) ON DELETE CASCADE,
+    device_id       UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    status          monitor_status NOT NULL,
+    value           DOUBLE PRECISION,
+    message         TEXT CHECK (char_length(message) <= 2000),
+    details         JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(details) <= 16384),
+    duration_ms     INT CHECK (duration_ms >= 0 AND duration_ms <= 600000),
+    error           TEXT CHECK (char_length(error) <= 2000),
+    observed_at     TIMESTAMPTZ NOT NULL,
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_monitor_results_monitor
+    ON monitor_results (monitor_id, observed_at DESC);
+CREATE INDEX idx_monitor_results_device
+    ON monitor_results (device_id, observed_at DESC);
+CREATE INDEX idx_monitor_results_org_time
+    ON monitor_results (organization_id, observed_at DESC);
+
+CREATE TRIGGER trg_monitor_results_org
+    BEFORE INSERT ON monitor_results
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+
+-- ============================================================
+-- ALERTS
+-- ============================================================
+CREATE TABLE alerts (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    device_id       UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    monitor_id      UUID REFERENCES monitors (id) ON DELETE SET NULL,
+    severity        monitor_severity NOT NULL,
+    status          alert_status NOT NULL DEFAULT 'open',
+    summary         TEXT NOT NULL CHECK (char_length(summary) BETWEEN 1 AND 500),
+    details         JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(details) <= 16384),
+    first_seen_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    acknowledged_at TIMESTAMPTZ,
+    acknowledged_by UUID REFERENCES auth.users (id),
+    resolved_at     TIMESTAMPTZ,
+    resolved_by     UUID REFERENCES auth.users (id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- At most one live alert per monitor/device pair.
+CREATE UNIQUE INDEX uq_alerts_open_monitor
+    ON alerts (monitor_id, device_id)
+    WHERE status <> 'resolved' AND monitor_id IS NOT NULL;
+CREATE INDEX idx_alerts_org_status ON alerts (organization_id, status, last_seen_at DESC);
+CREATE INDEX idx_alerts_device ON alerts (device_id, status);
+
+CREATE TRIGGER trg_alerts_updated_at
+    BEFORE UPDATE ON alerts
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE alert_events (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    alert_id    UUID NOT NULL REFERENCES alerts (id) ON DELETE CASCADE,
+    event_type  TEXT NOT NULL CHECK (char_length(event_type) <= 40),
+    actor_type  actor_type NOT NULL DEFAULT 'system',
+    actor_id    UUID,
+    note        TEXT CHECK (char_length(note) <= 2000),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_alert_events_alert ON alert_events (alert_id, created_at);
+
+-- ============================================================
+-- WINDOWS EVENT LOG RECORDS
+-- ============================================================
+CREATE TABLE device_events (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    device_id       UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    log_name        TEXT NOT NULL CHECK (char_length(log_name) BETWEEN 1 AND 128),
+    provider        TEXT CHECK (char_length(provider) <= 256),
+    event_id        INT,
+    level           TEXT CHECK (char_length(level) <= 40),
+    recorded_at     TIMESTAMPTZ,
+    message         TEXT CHECK (char_length(message) <= 4000),
+    -- Stable agent-generated identity used to make ingestion idempotent across
+    -- reconnects and retries.
+    dedupe_key      TEXT NOT NULL CHECK (char_length(dedupe_key) BETWEEN 1 AND 200),
+    details         JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(details) <= 8192),
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (device_id, dedupe_key)
+);
+
+CREATE INDEX idx_device_events_device ON device_events (device_id, recorded_at DESC);
+CREATE INDEX idx_device_events_org ON device_events (organization_id, recorded_at DESC);
+CREATE INDEX idx_device_events_level ON device_events (organization_id, level, received_at DESC);
+
+CREATE TRIGGER trg_device_events_org
+    BEFORE INSERT ON device_events
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+
+CREATE TABLE agent_health_events (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    device_id       UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    event_type      TEXT NOT NULL CHECK (char_length(event_type) <= 60),
+    detail          TEXT CHECK (char_length(detail) <= 2000),
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_agent_health_device ON agent_health_events (device_id, recorded_at DESC);
+
+CREATE TRIGGER trg_agent_health_org
+    BEFORE INSERT ON agent_health_events
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+
+-- ============================================================
+-- SOFTWARE INVENTORY
+-- ============================================================
+CREATE TABLE device_software (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    device_id       UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    -- Stable identity across scans: lower(name)|publisher|architecture.
+    product_key     TEXT NOT NULL CHECK (char_length(product_key) BETWEEN 1 AND 400),
+    name            TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 300),
+    publisher       TEXT CHECK (char_length(publisher) <= 300),
+    version         TEXT CHECK (char_length(version) <= 80),
+    architecture    TEXT CHECK (char_length(architecture) <= 20),
+    install_date    DATE,
+    install_source  TEXT CHECK (char_length(install_source) <= 1000),
+    product_code    TEXT CHECK (char_length(product_code) <= 100),
+    scope           TEXT NOT NULL DEFAULT 'machine' CHECK (scope IN ('machine', 'user')),
+    detected_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (device_id, product_key)
+);
+
+CREATE INDEX idx_device_software_device ON device_software (device_id, name);
+CREATE INDEX idx_device_software_org ON device_software (organization_id, name);
+CREATE INDEX idx_device_software_product ON device_software (organization_id, product_code);
+
+CREATE TRIGGER trg_device_software_org
+    BEFORE INSERT OR UPDATE ON device_software
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+CREATE TRIGGER trg_device_software_updated_at
+    BEFORE UPDATE ON device_software
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE software_change_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    device_id       UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    change_type     software_change_type NOT NULL,
+    product_key     TEXT NOT NULL CHECK (char_length(product_key) BETWEEN 1 AND 400),
+    name            TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 300),
+    from_version    TEXT CHECK (char_length(from_version) <= 80),
+    to_version      TEXT CHECK (char_length(to_version) <= 80),
+    -- 'confirmed' means an audited management job caused the change;
+    -- 'inferred' means it was derived by comparing inventory snapshots.
+    source          TEXT NOT NULL DEFAULT 'inferred' CHECK (source IN ('confirmed', 'inferred')),
+    deployment_job_id UUID,
+    actor_user_id   UUID REFERENCES auth.users (id),
+    detected_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_software_changes_device ON software_change_events (device_id, detected_at DESC);
+CREATE INDEX idx_software_changes_org ON software_change_events (organization_id, detected_at DESC);
+
+CREATE TRIGGER trg_software_changes_org
+    BEFORE INSERT ON software_change_events
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+
+-- ============================================================
+-- PACKAGE REPOSITORY
+-- ============================================================
+CREATE TABLE software_packages (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    name            TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 160),
+    description     TEXT CHECK (char_length(description) <= 2000),
+    publisher       TEXT CHECK (char_length(publisher) <= 160),
+    is_internal     BOOLEAN NOT NULL DEFAULT FALSE,
+    visibility      TEXT NOT NULL DEFAULT 'organization'
+        CHECK (visibility IN ('organization', 'private')),
+    created_by      UUID REFERENCES auth.users (id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (organization_id, name)
+);
+
+CREATE INDEX idx_packages_org ON software_packages (organization_id);
+
+CREATE TRIGGER trg_packages_updated_at
+    BEFORE UPDATE ON software_packages
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE software_package_versions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    package_id          UUID NOT NULL REFERENCES software_packages (id) ON DELETE CASCADE,
+    organization_id     UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    version             TEXT NOT NULL CHECK (char_length(version) BETWEEN 1 AND 60),
+    package_format      package_format NOT NULL,
+    architecture        TEXT NOT NULL DEFAULT 'x64' CHECK (architecture IN ('x64', 'x86', 'arm64', 'any')),
+    supported_os        TEXT CHECK (char_length(supported_os) <= 300),
+    -- Object path inside the private package storage bucket.
+    storage_path        TEXT NOT NULL CHECK (
+        char_length(storage_path) BETWEEN 1 AND 500
+        AND storage_path NOT LIKE '%..%'
+        AND storage_path NOT LIKE '/%'
+    ),
+    sha256              TEXT NOT NULL CHECK (sha256 ~ '^[a-f0-9]{64}$'),
+    file_size_bytes     BIGINT NOT NULL CHECK (file_size_bytes > 0 AND file_size_bytes <= 4294967296),
+    signature_subject   TEXT CHECK (char_length(signature_subject) <= 500),
+    signature_verified  BOOLEAN NOT NULL DEFAULT FALSE,
+    install_args        TEXT CHECK (char_length(install_args) <= 2000),
+    uninstall_args      TEXT CHECK (char_length(uninstall_args) <= 2000),
+    repair_args         TEXT CHECK (char_length(repair_args) <= 2000),
+    -- Detection document evaluated by the agent after installation, e.g.
+    -- {"type":"msi_product_code","value":"{GUID}"} or
+    -- {"type":"file_version","path":"C:\\Program Files\\...","min_version":"2.0"}.
+    detection_rules     JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(detection_rules) <= 8192),
+    prerequisites       JSONB NOT NULL DEFAULT '[]'::JSONB
+        CHECK (pg_column_size(prerequisites) <= 16384),
+    requires_reboot     BOOLEAN NOT NULL DEFAULT FALSE,
+    approval_status     package_approval_status NOT NULL DEFAULT 'pending',
+    approved_by         UUID REFERENCES auth.users (id),
+    approved_at         TIMESTAMPTZ,
+    published_at        TIMESTAMPTZ,
+    -- Rollback is only advertised when a known recoverable version exists.
+    rollback_version_id UUID REFERENCES software_package_versions (id),
+    created_by          UUID REFERENCES auth.users (id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (package_id, version),
+    CONSTRAINT chk_msi_silent CHECK (
+        -- Documented MSI packages must carry an explicit silent install mode.
+        package_format <> 'msi' OR install_args IS NULL OR install_args ILIKE '%/qn%'
+        OR install_args ILIKE '%/quiet%'
+    )
+);
+
+CREATE INDEX idx_package_versions_package ON software_package_versions (package_id, created_at DESC);
+CREATE INDEX idx_package_versions_org ON software_package_versions (organization_id, approval_status);
+
+CREATE TRIGGER trg_package_versions_updated_at
+    BEFORE UPDATE ON software_package_versions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- ============================================================
+-- DEPLOYMENT POLICIES AND JOBS
+-- ============================================================
+CREATE TABLE deployment_policies (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id     UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    name                TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 160),
+    package_version_id  UUID NOT NULL REFERENCES software_package_versions (id) ON DELETE CASCADE,
+    operation           deployment_operation NOT NULL DEFAULT 'install',
+    target_type         deployment_target_type NOT NULL,
+    target_device_id    UUID REFERENCES devices (id) ON DELETE CASCADE,
+    target_group_id     UUID REFERENCES device_groups (id) ON DELETE CASCADE,
+    schedule_at         TIMESTAMPTZ,
+    -- {"days":[1,2,3,4,5],"start":"02:00","end":"04:00","timezone":"UTC"}
+    maintenance_window  JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (pg_column_size(maintenance_window) <= 4096),
+    concurrency_limit   INT NOT NULL DEFAULT 5 CHECK (concurrency_limit BETWEEN 1 AND 100),
+    max_attempts        INT NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 5),
+    reboot_policy       TEXT NOT NULL DEFAULT 'never'
+        CHECK (reboot_policy IN ('never', 'if_required', 'always')),
+    enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by          UUID REFERENCES auth.users (id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_policy_target CHECK (
+        (target_type = 'device' AND target_device_id IS NOT NULL AND target_group_id IS NULL)
+        OR (target_type = 'group' AND target_group_id IS NOT NULL AND target_device_id IS NULL)
+    )
+);
+
+CREATE INDEX idx_deployment_policies_org ON deployment_policies (organization_id, enabled);
+
+CREATE TRIGGER trg_deployment_policies_updated_at
+    BEFORE UPDATE ON deployment_policies
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE deployment_jobs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id     UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
+    device_id           UUID NOT NULL REFERENCES devices (id) ON DELETE CASCADE,
+    package_version_id  UUID NOT NULL REFERENCES software_package_versions (id),
+    policy_id           UUID REFERENCES deployment_policies (id) ON DELETE SET NULL,
+    operation           deployment_operation NOT NULL DEFAULT 'install',
+    state               deployment_state NOT NULL DEFAULT 'queued',
+    progress            INT NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+    attempts            INT NOT NULL DEFAULT 0 CHECK (attempts >= 0 AND attempts <= 10),
+    max_attempts        INT NOT NULL DEFAULT 2 CHECK (max_attempts BETWEEN 1 AND 5),
+    scheduled_for       TIMESTAMPTZ,
+    claimed_at          TIMESTAMPTZ,
+    started_at          TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    exit_code           INT,
+    error_summary       TEXT CHECK (char_length(error_summary) <= 2000),
+    stdout_text         TEXT CHECK (char_length(stdout_text) <= 65536),
+    stderr_text         TEXT CHECK (char_length(stderr_text) <= 16384),
+    reboot_required     BOOLEAN NOT NULL DEFAULT FALSE,
+    rollback_available  BOOLEAN NOT NULL DEFAULT FALSE,
+    requested_by        UUID REFERENCES auth.users (id),
+    idempotency_key     TEXT CHECK (char_length(idempotency_key) <= 128),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX uq_deployment_idempotency
+    ON deployment_jobs (organization_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+CREATE INDEX idx_deployment_jobs_device
+    ON deployment_jobs (device_id, state, scheduled_for);
+CREATE INDEX idx_deployment_jobs_org
+    ON deployment_jobs (organization_id, created_at DESC);
+-- Agent claim path.
+CREATE INDEX idx_deployment_jobs_claim
+    ON deployment_jobs (device_id, scheduled_for)
+    WHERE state IN ('pending', 'queued');
+CREATE INDEX idx_deployment_jobs_active
+    ON deployment_jobs (organization_id, state)
+    WHERE state IN ('downloading', 'validating', 'installing', 'verifying');
+
+CREATE TRIGGER trg_deployment_jobs_updated_at
+    BEFORE UPDATE ON deployment_jobs
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER trg_deployment_jobs_org
+    BEFORE INSERT OR UPDATE ON deployment_jobs
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_device_org();
+
+CREATE TABLE deployment_attempts (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id          UUID NOT NULL REFERENCES deployment_jobs (id) ON DELETE CASCADE,
+    attempt_number  INT NOT NULL CHECK (attempt_number >= 1),
+    state           deployment_state NOT NULL,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at    TIMESTAMPTZ,
+    exit_code       INT,
+    output          TEXT CHECK (char_length(output) <= 32768),
+    error_summary   TEXT CHECK (char_length(error_summary) <= 2000),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (job_id, attempt_number)
+);
+
+CREATE INDEX idx_deployment_attempts_job ON deployment_attempts (job_id, attempt_number);
+
+CREATE TRIGGER trg_deployment_attempts_updated_at
+    BEFORE UPDATE ON deployment_attempts
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- ============================================================
+-- TENANT CONSISTENCY GUARDS
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_assert_monitor_org()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.device_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM devices WHERE id = NEW.device_id
+          AND organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'monitor_device_org_mismatch';
+    END IF;
+    IF NEW.group_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM device_groups WHERE id = NEW.group_id
+          AND organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'monitor_group_org_mismatch';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_monitors_org
+    BEFORE INSERT OR UPDATE ON monitors
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_monitor_org();
+
+CREATE OR REPLACE FUNCTION rmm_assert_package_version_org()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM software_packages
+        WHERE id = NEW.package_id AND organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'package_version_org_mismatch';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_package_versions_org
+    BEFORE INSERT OR UPDATE ON software_package_versions
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_package_version_org();
+
+CREATE OR REPLACE FUNCTION rmm_assert_deployment_job_org()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM software_package_versions
+        WHERE id = NEW.package_version_id AND organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'deployment_package_org_mismatch';
+    END IF;
+    IF NEW.policy_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM deployment_policies
+        WHERE id = NEW.policy_id AND organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'deployment_policy_org_mismatch';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_deployment_jobs_org_check
+    BEFORE INSERT OR UPDATE ON deployment_jobs
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_deployment_job_org();
+
+CREATE OR REPLACE FUNCTION rmm_assert_deployment_policy_org()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM software_package_versions
+        WHERE id = NEW.package_version_id AND organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'policy_package_org_mismatch';
+    END IF;
+    IF NEW.target_device_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM devices
+        WHERE id = NEW.target_device_id AND organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'policy_device_org_mismatch';
+    END IF;
+    IF NEW.target_group_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM device_groups
+        WHERE id = NEW.target_group_id AND organization_id = NEW.organization_id
+    ) THEN
+        RAISE EXCEPTION 'policy_group_org_mismatch';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_deployment_policies_org
+    BEFORE INSERT OR UPDATE ON deployment_policies
+    FOR EACH ROW EXECUTE FUNCTION rmm_assert_deployment_policy_org();
+
+-- ============================================================
+-- GROUP MEMBERSHIP EXPANSION
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_device_matches_group(p_device_id UUID, p_group_id UUID)
+RETURNS BOOLEAN
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_group  device_groups;
+    v_device devices;
+    v_inv    device_inventory;
+    v_rule   JSONB;
+    v_match  TEXT;
+    v_field  TEXT;
+    v_op     TEXT;
+    v_value  TEXT;
+    v_actual TEXT;
+    v_ok     BOOLEAN;
+    v_all    BOOLEAN;
+BEGIN
+    SELECT * INTO v_group FROM device_groups WHERE id = p_group_id;
+    IF NOT FOUND THEN RETURN FALSE; END IF;
+
+    SELECT * INTO v_device FROM devices
+    WHERE id = p_device_id AND organization_id = v_group.organization_id;
+    IF NOT FOUND THEN RETURN FALSE; END IF;
+
+    IF v_group.group_type = 'static' THEN
+        RETURN EXISTS (
+            SELECT 1 FROM device_group_members
+            WHERE group_id = p_group_id AND device_id = p_device_id
+        );
+    END IF;
+
+    SELECT * INTO v_inv FROM device_inventory WHERE device_id = p_device_id;
+
+    v_match := lower(COALESCE(v_group.dynamic_rules ->> 'match', 'all'));
+    IF v_match NOT IN ('all', 'any') THEN
+        v_match := 'all';
+    END IF;
+    -- 'any' must start false, otherwise the empty OR seed would match.
+    v_all := (v_match = 'all');
+
+    IF jsonb_typeof(v_group.dynamic_rules -> 'rules') <> 'array' THEN
+        RETURN FALSE;
+    END IF;
+
+    FOR v_rule IN SELECT * FROM jsonb_array_elements(v_group.dynamic_rules -> 'rules')
+    LOOP
+        v_field := lower(COALESCE(v_rule ->> 'field', ''));
+        v_op := lower(COALESCE(v_rule ->> 'op', 'eq'));
+        v_value := COALESCE(v_rule ->> 'value', '');
+
+        v_actual := CASE v_field
+            WHEN 'hostname' THEN COALESCE(v_device.hostname, '')
+            WHEN 'display_name' THEN v_device.display_name
+            WHEN 'os' THEN COALESCE(v_device.operating_system, '')
+            WHEN 'os_version' THEN COALESCE(v_inv.os ->> 'version', '')
+            WHEN 'os_build' THEN COALESCE(v_inv.os ->> 'build', '')
+            WHEN 'agent_version' THEN COALESCE(v_device.agent_version, '')
+            WHEN 'manufacturer' THEN COALESCE(v_inv.hardware ->> 'manufacturer', '')
+            WHEN 'model' THEN COALESCE(v_inv.hardware ->> 'model', '')
+            WHEN 'tag' THEN COALESCE(v_device.metadata -> 'tags', '[]'::JSONB)::TEXT
+            ELSE NULL
+        END;
+
+        IF v_actual IS NULL THEN
+            -- Unsupported field or missing data: a dynamic rule must not
+            -- accidentally match every device.
+            v_ok := FALSE;
+        ELSE
+            v_ok := CASE v_op
+                WHEN 'eq' THEN lower(v_actual) = lower(v_value)
+                WHEN 'neq' THEN lower(v_actual) <> lower(v_value)
+                WHEN 'contains' THEN position(lower(v_value) in lower(v_actual)) > 0
+                WHEN 'not_contains' THEN position(lower(v_value) in lower(v_actual)) = 0
+                WHEN 'starts_with' THEN lower(v_actual) LIKE lower(v_value) || '%'
+                WHEN 'in' THEN lower(v_actual) = ANY (
+                    SELECT lower(TRIM(x)) FROM jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(v_rule -> 'values') = 'array'
+                             THEN v_rule -> 'values' ELSE '[]'::JSONB END
+                    ) AS x
+                )
+                ELSE FALSE
+            END;
+        END IF;
+
+        IF v_match = 'any' THEN
+            v_all := v_all OR v_ok;
+        ELSE
+            v_all := v_all AND v_ok;
+        END IF;
+    END LOOP;
+
+    RETURN COALESCE(v_all, FALSE);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rmm_group_device_ids(p_group_id UUID)
+RETURNS SETOF UUID
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_group device_groups;
+    v_device RECORD;
+BEGIN
+    SELECT * INTO v_group FROM device_groups WHERE id = p_group_id;
+    IF NOT FOUND THEN RETURN; END IF;
+
+    FOR v_device IN
+        SELECT d.id FROM devices d
+        WHERE d.organization_id = v_group.organization_id
+          AND d.enrollment_status = 'enrolled'
+    LOOP
+        IF rmm_device_matches_group(v_device.id, p_group_id) THEN
+            RETURN NEXT v_device.id;
+        END IF;
+    END LOOP;
+END;
+$$;
+
+-- ============================================================
+-- AGENT HEARTBEAT (extended)
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_heartbeat(
+    p_device_id UUID,
+    p_hostname TEXT,
+    p_os TEXT,
+    p_agent_version TEXT,
+    p_service_status TEXT,
+    p_is_elevated BOOLEAN,
+    p_execution_account TEXT,
+    p_connection_failures INT DEFAULT 0,
+    p_reconnect_attempts INT DEFAULT 0,
+    p_restart_required BOOLEAN DEFAULT FALSE
+)
+RETURNS TABLE (
+    enrollment_status TEXT,
+    pending_jobs INT,
+    pending_deployments INT,
+    server_time TIMESTAMPTZ,
+    offline_after_seconds INT,
+    metrics_interval_seconds INT,
+    inventory_interval_seconds INT,
+    software_scan_interval_seconds INT,
+    event_scan_interval_seconds INT,
+    allow_custom_powershell_monitors BOOLEAN,
+    allow_security_event_collection BOOLEAN,
+    allow_service_recovery BOOLEAN,
+    service_recovery_cooldown_seconds INT,
+    max_event_bytes_per_scan INT
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_device devices;
+    v_settings organization_settings;
+BEGIN
+    SELECT * INTO v_device FROM devices WHERE id = p_device_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'device_not_found';
+    END IF;
+
+    UPDATE devices SET
+        last_seen_at        = now(),
+        last_heartbeat_at   = now(),
+        hostname            = LEFT(COALESCE(NULLIF(TRIM(p_hostname), ''), hostname), 253),
+        operating_system    = LEFT(COALESCE(NULLIF(TRIM(p_os), ''), operating_system), 100),
+        agent_version       = LEFT(COALESCE(NULLIF(TRIM(p_agent_version), ''), agent_version), 40),
+        service_status      = LEFT(COALESCE(NULLIF(TRIM(p_service_status), ''), service_status), 40),
+        is_elevated         = COALESCE(p_is_elevated, is_elevated),
+        execution_account   = LEFT(COALESCE(NULLIF(TRIM(p_execution_account), ''), execution_account), 120),
+        heartbeat_failures  = GREATEST(COALESCE(p_connection_failures, 0), 0),
+        reconnect_attempts  = GREATEST(COALESCE(p_reconnect_attempts, 0), 0),
+        agent_restart_required = COALESCE(p_restart_required, FALSE),
+        updated_at          = now()
+    WHERE id = p_device_id;
+
+    SELECT * INTO v_settings FROM organization_settings
+    WHERE organization_id = v_device.organization_id;
+
+    -- Heartbeat restores online state after a communication outage.
+    IF v_device.enrollment_status = 'enrolled' AND v_device.service_status = 'offline' THEN
+        INSERT INTO agent_health_events (organization_id, device_id, event_type, detail)
+        VALUES (v_device.organization_id, p_device_id, 'agent.reconnected', 'Heartbeat received after outage');
+    END IF;
+
+    RETURN QUERY SELECT
+        v_device.enrollment_status::TEXT,
+        (SELECT COUNT(*)::INT FROM jobs j
+          WHERE j.device_id = p_device_id
+            AND j.state IN ('queued', 'waiting_for_device')
+            AND j.expires_at > now()),
+        (SELECT COUNT(*)::INT FROM deployment_jobs dj
+          WHERE dj.device_id = p_device_id
+            AND dj.state IN ('pending', 'queued')),
+        now(),
+        COALESCE(v_settings.offline_after_seconds, 300),
+        COALESCE(v_settings.metrics_interval_seconds, 60),
+        COALESCE(v_settings.inventory_interval_seconds, 21600),
+        COALESCE(v_settings.software_scan_interval_seconds, 21600),
+        COALESCE(v_settings.event_scan_interval_seconds, 300),
+        COALESCE(v_settings.allow_custom_powershell_monitors, FALSE),
+        COALESCE(v_settings.allow_security_event_collection, FALSE),
+        COALESCE(v_settings.allow_service_recovery, FALSE),
+        COALESCE(v_settings.service_recovery_cooldown_seconds, 600),
+        COALESCE(v_settings.max_event_bytes_per_scan, 1048576);
+END;
+$$;
+
+-- ============================================================
+-- INGEST: INVENTORY
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_ingest_inventory(
+    p_device_id UUID,
+    p_hardware JSONB,
+    p_os JSONB,
+    p_network JSONB,
+    p_data_quality JSONB,
+    p_collected_at TIMESTAMPTZ
+)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_device devices;
+    v_hash TEXT;
+    v_previous TEXT;
+    v_snapshot BOOLEAN := FALSE;
+BEGIN
+    SELECT * INTO v_device FROM devices
+    WHERE id = p_device_id AND enrollment_status = 'enrolled';
+    IF NOT FOUND THEN RAISE EXCEPTION 'device_not_authorized'; END IF;
+
+    IF p_hardware IS NULL OR jsonb_typeof(p_hardware) <> 'object'
+       OR jsonb_typeof(COALESCE(p_os, '{}'::JSONB)) <> 'object'
+       OR jsonb_typeof(COALESCE(p_network, '{}'::JSONB)) <> 'object' THEN
+        RAISE EXCEPTION 'invalid_inventory_payload';
+    END IF;
+    IF pg_column_size(p_hardware) > 65536
+       OR pg_column_size(COALESCE(p_os, '{}'::JSONB)) > 32768
+       OR pg_column_size(COALESCE(p_network, '{}'::JSONB)) > 65536 THEN
+        RAISE EXCEPTION 'inventory_payload_too_large';
+    END IF;
+    IF p_collected_at > now() + interval '1 hour'
+       OR p_collected_at < now() - interval '30 days' THEN
+        RAISE EXCEPTION 'invalid_collected_at';
+    END IF;
+
+    v_hash := md5(p_hardware::TEXT || COALESCE(p_os, '{}'::JSONB)::TEXT
+                  || COALESCE(p_network, '{}'::JSONB)::TEXT);
+
+    SELECT content_hash INTO v_previous
+    FROM device_inventory_snapshots
+    WHERE device_id = p_device_id
+    ORDER BY collected_at DESC
+    LIMIT 1;
+    v_snapshot := (v_previous IS DISTINCT FROM v_hash);
+
+    INSERT INTO device_inventory AS di
+        (device_id, organization_id, hardware, os, network, data_quality, collected_at)
+    VALUES
+        (p_device_id, v_device.organization_id, p_hardware,
+         COALESCE(p_os, '{}'::JSONB), COALESCE(p_network, '{}'::JSONB),
+         COALESCE(p_data_quality, '{}'::JSONB), p_collected_at)
+    ON CONFLICT (device_id) DO UPDATE SET
+        hardware = EXCLUDED.hardware,
+        os = EXCLUDED.os,
+        network = EXCLUDED.network,
+        data_quality = EXCLUDED.data_quality,
+        collected_at = EXCLUDED.collected_at,
+        received_at = now(),
+        updated_at = now();
+
+    IF v_snapshot THEN
+        INSERT INTO device_inventory_snapshots
+            (device_id, organization_id, content_hash, hardware, os, network, collected_at)
+        VALUES
+            (p_device_id, v_device.organization_id, v_hash, p_hardware,
+             COALESCE(p_os, '{}'::JSONB), COALESCE(p_network, '{}'::JSONB), p_collected_at);
+
+        -- Keep the newest 50 snapshots per device.
+        DELETE FROM device_inventory_snapshots
+        WHERE id IN (
+            SELECT id FROM device_inventory_snapshots
+            WHERE device_id = p_device_id
+            ORDER BY collected_at DESC
+            OFFSET 50
+        );
+    END IF;
+
+    UPDATE devices SET last_inventory_at = now() WHERE id = p_device_id;
+
+    RETURN jsonb_build_object('ok', TRUE, 'snapshot_created', v_snapshot, 'collected_at', p_collected_at);
+END;
+$$;
+
+-- ============================================================
+-- INGEST: METRICS (bounded batch)
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_ingest_metrics(
+    p_device_id UUID,
+    p_samples JSONB
+)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_device devices;
+    v_count INT;
+    v_inserted INT := 0;
+    v_sample JSONB;
+    v_metric TEXT;
+    v_value DOUBLE PRECISION;
+    v_collected TIMESTAMPTZ;
+BEGIN
+    SELECT * INTO v_device FROM devices
+    WHERE id = p_device_id AND enrollment_status = 'enrolled';
+    IF NOT FOUND THEN RAISE EXCEPTION 'device_not_authorized'; END IF;
+
+    IF jsonb_typeof(p_samples) <> 'array' THEN
+        RAISE EXCEPTION 'invalid_metrics_payload';
+    END IF;
+    v_count := jsonb_array_length(p_samples);
+    IF v_count = 0 THEN
+        RETURN jsonb_build_object('inserted', 0);
+    END IF;
+    IF v_count > 500 THEN
+        RAISE EXCEPTION 'metrics_batch_too_large';
+    END IF;
+    IF pg_column_size(p_samples) > 262144 THEN
+        RAISE EXCEPTION 'metrics_payload_too_large';
+    END IF;
+
+    -- Per-device ingestion ceiling (protects the table from a runaway agent).
+    IF (SELECT COUNT(*) FROM device_metrics
+        WHERE device_id = p_device_id
+          AND received_at > now() - interval '1 minute') + v_count > 3000 THEN
+        RAISE EXCEPTION 'metrics_rate_limit_exceeded';
+    END IF;
+
+    FOR v_sample IN SELECT * FROM jsonb_array_elements(p_samples)
+    LOOP
+        v_metric := LEFT(COALESCE(v_sample ->> 'metric', ''), 80);
+        IF v_metric !~ '^[a-z0-9_.-]{1,80}$' THEN
+            RAISE EXCEPTION 'invalid_metric_name';
+        END IF;
+        IF jsonb_typeof(v_sample -> 'value') NOT IN ('number') THEN
+            RAISE EXCEPTION 'invalid_metric_value';
+        END IF;
+        v_value := (v_sample ->> 'value')::DOUBLE PRECISION;
+        IF v_value = 'NaN'::DOUBLE PRECISION OR v_value IN ('Infinity'::DOUBLE PRECISION, '-Infinity'::DOUBLE PRECISION) THEN
+            RAISE EXCEPTION 'invalid_metric_value';
+        END IF;
+
+        v_collected := COALESCE((v_sample ->> 'collected_at')::TIMESTAMPTZ, now());
+        IF v_collected > now() + interval '1 hour' OR v_collected < now() - interval '7 days' THEN
+            RAISE EXCEPTION 'invalid_metric_timestamp';
+        END IF;
+
+        INSERT INTO device_metrics
+            (organization_id, device_id, metric, value, dimensions, collected_at)
+        VALUES
+            (v_device.organization_id, p_device_id, v_metric, v_value,
+             CASE WHEN jsonb_typeof(v_sample -> 'dimensions') = 'object'
+                  AND pg_column_size(v_sample -> 'dimensions') <= 2048
+                  THEN v_sample -> 'dimensions' ELSE '{}'::JSONB END,
+             v_collected);
+        v_inserted := v_inserted + 1;
+    END LOOP;
+
+    UPDATE devices SET last_metric_at = now() WHERE id = p_device_id;
+    RETURN jsonb_build_object('inserted', v_inserted);
+END;
+$$;
+
+-- ============================================================
+-- INGEST: WINDOWS EVENT LOG
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_ingest_events(
+    p_device_id UUID,
+    p_events JSONB
+)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_device devices;
+    v_count INT;
+    v_event JSONB;
+    v_inserted INT;
+    v_total INT := 0;
+BEGIN
+    SELECT * INTO v_device FROM devices
+    WHERE id = p_device_id AND enrollment_status = 'enrolled';
+    IF NOT FOUND THEN RAISE EXCEPTION 'device_not_authorized'; END IF;
+
+    IF jsonb_typeof(p_events) <> 'array' THEN
+        RAISE EXCEPTION 'invalid_events_payload';
+    END IF;
+    v_count := jsonb_array_length(p_events);
+    IF v_count = 0 THEN RETURN jsonb_build_object('inserted', 0); END IF;
+    IF v_count > 200 OR pg_column_size(p_events) > 1048576 THEN
+        RAISE EXCEPTION 'events_batch_too_large';
+    END IF;
+
+    FOR v_event IN SELECT * FROM jsonb_array_elements(p_events)
+    LOOP
+        IF COALESCE(v_event ->> 'log_name', '') = ''
+           OR COALESCE(v_event ->> 'dedupe_key', '') = '' THEN
+            RAISE EXCEPTION 'invalid_event';
+        END IF;
+
+        INSERT INTO device_events
+            (organization_id, device_id, log_name, provider, event_id, level,
+             recorded_at, message, dedupe_key, details)
+        VALUES
+            (v_device.organization_id, p_device_id,
+             LEFT(v_event ->> 'log_name', 128),
+             LEFT(NULLIF(v_event ->> 'provider', ''), 256),
+             CASE WHEN (v_event ->> 'event_id') ~ '^-?[0-9]{1,6}$'
+                  THEN (v_event ->> 'event_id')::INT ELSE NULL END,
+             LEFT(NULLIF(v_event ->> 'level', ''), 40),
+             NULLIF(v_event ->> 'recorded_at', '')::TIMESTAMPTZ,
+             LEFT(NULLIF(v_event ->> 'message', ''), 4000),
+             LEFT(v_event ->> 'dedupe_key', 200),
+             CASE WHEN jsonb_typeof(v_event -> 'details') = 'object'
+                  THEN v_event -> 'details' ELSE '{}'::JSONB END)
+        ON CONFLICT (device_id, dedupe_key) DO NOTHING;
+        GET DIAGNOSTICS v_inserted = ROW_COUNT;
+        v_total := v_total + v_inserted;
+    END LOOP;
+
+    UPDATE devices SET last_event_at = now() WHERE id = p_device_id;
+    RETURN jsonb_build_object('inserted', v_total);
+END;
+$$;
+
+-- ============================================================
+-- INGEST: SOFTWARE INVENTORY (diffing)
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_ingest_software(
+    p_device_id UUID,
+    p_apps JSONB,
+    p_collected_at TIMESTAMPTZ DEFAULT now()
+)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_device devices;
+    v_count INT;
+    v_app JSONB;
+    v_added INT := 0;
+    v_updated INT := 0;
+    v_removed INT := 0;
+    v_key TEXT;
+    v_name TEXT;
+    v_publisher TEXT;
+    v_version TEXT;
+    v_arch TEXT;
+    v_previous device_software;
+    v_existed BOOLEAN;
+BEGIN
+    SELECT * INTO v_device FROM devices
+    WHERE id = p_device_id AND enrollment_status = 'enrolled';
+    IF NOT FOUND THEN RAISE EXCEPTION 'device_not_authorized'; END IF;
+
+    IF jsonb_typeof(p_apps) <> 'array' THEN
+        RAISE EXCEPTION 'invalid_software_payload';
+    END IF;
+    v_count := jsonb_array_length(p_apps);
+    IF v_count > 3000 OR pg_column_size(p_apps) > 2097152 THEN
+        RAISE EXCEPTION 'software_payload_too_large';
+    END IF;
+    IF p_collected_at > now() + interval '1 hour'
+       OR p_collected_at < now() - interval '30 days' THEN
+        RAISE EXCEPTION 'invalid_collected_at';
+    END IF;
+
+    -- Snapshot the scan in a temp set so removed products can be derived.
+    CREATE TEMP TABLE IF NOT EXISTS rmm_scan_apps (
+        product_key TEXT PRIMARY KEY,
+        name TEXT,
+        publisher TEXT,
+        version TEXT,
+        architecture TEXT
+    ) ON COMMIT DROP;
+    TRUNCATE rmm_scan_apps;
+
+    FOR v_app IN SELECT * FROM jsonb_array_elements(p_apps)
+    LOOP
+        v_key := LEFT(COALESCE(v_app ->> 'product_key', ''), 400);
+        v_name := LEFT(COALESCE(v_app ->> 'name', ''), 300);
+        IF v_key = '' OR v_name = '' THEN
+            CONTINUE; -- malformed entries are skipped, never trusted
+        END IF;
+        v_publisher := LEFT(NULLIF(v_app ->> 'publisher', ''), 300);
+        v_version := LEFT(NULLIF(v_app ->> 'version', ''), 80);
+        v_arch := LEFT(NULLIF(v_app ->> 'architecture', ''), 20);
+
+        INSERT INTO rmm_scan_apps VALUES (v_key, v_name, v_publisher, v_version, v_arch)
+        ON CONFLICT (product_key) DO NOTHING;
+
+        SELECT * INTO v_previous FROM device_software
+        WHERE device_id = p_device_id AND product_key = v_key;
+        v_existed := FOUND;
+
+        INSERT INTO device_software AS ds
+            (organization_id, device_id, product_key, name, publisher, version,
+             architecture, install_date, install_source, product_code, scope, detected_at)
+        VALUES
+            (v_device.organization_id, p_device_id, v_key, v_name, v_publisher, v_version,
+             v_arch,
+             NULLIF(v_app ->> 'install_date', '')::DATE,
+             LEFT(NULLIF(v_app ->> 'install_source', ''), 1000),
+             LEFT(NULLIF(v_app ->> 'product_code', ''), 100),
+             CASE WHEN v_app ->> 'scope' = 'user' THEN 'user' ELSE 'machine' END,
+             p_collected_at)
+        ON CONFLICT (device_id, product_key) DO UPDATE SET
+            name = EXCLUDED.name,
+            publisher = EXCLUDED.publisher,
+            version = EXCLUDED.version,
+            architecture = EXCLUDED.architecture,
+            install_date = EXCLUDED.install_date,
+            install_source = EXCLUDED.install_source,
+            product_code = EXCLUDED.product_code,
+            scope = EXCLUDED.scope,
+            detected_at = EXCLUDED.detected_at,
+            updated_at = now();
+
+        IF NOT v_existed THEN
+            v_added := v_added + 1;
+            INSERT INTO software_change_events
+                (organization_id, device_id, change_type, product_key, name,
+                 to_version, source, detected_at)
+            VALUES
+                (v_device.organization_id, p_device_id, 'detected', v_key, v_name,
+                 v_version, 'inferred', p_collected_at);
+        ELSIF v_previous.version IS DISTINCT FROM v_version THEN
+            v_updated := v_updated + 1;
+            INSERT INTO software_change_events
+                (organization_id, device_id, change_type, product_key, name,
+                 from_version, to_version, source, detected_at)
+            VALUES
+                (v_device.organization_id, p_device_id, 'updated', v_key, v_name,
+                 v_previous.version, v_version, 'inferred', p_collected_at);
+        END IF;
+    END LOOP;
+
+    -- Remove products that are no longer present.
+    FOR v_previous IN
+        SELECT * FROM device_software
+        WHERE device_id = p_device_id
+          AND product_key NOT IN (SELECT product_key FROM rmm_scan_apps)
+    LOOP
+        INSERT INTO software_change_events
+            (organization_id, device_id, change_type, product_key, name,
+             from_version, to_version, source, detected_at)
+        VALUES
+            (v_device.organization_id, p_device_id, 'removed', v_previous.product_key,
+             v_previous.name, v_previous.version, NULL, 'inferred', p_collected_at);
+
+        DELETE FROM device_software WHERE id = v_previous.id;
+        v_removed := v_removed + 1;
+    END LOOP;
+
+    UPDATE devices SET last_software_scan_at = now() WHERE id = p_device_id;
+    RETURN jsonb_build_object(
+        'added', v_added, 'updated', v_updated, 'removed', v_removed,
+        'total', (SELECT COUNT(*) FROM device_software WHERE device_id = p_device_id));
+END;
+$$;
+
+-- ============================================================
+-- MONITOR RESULTS AND ALERT STATE MACHINE
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_report_monitor_result(
+    p_device_id UUID,
+    p_monitor_id UUID,
+    p_status monitor_status,
+    p_value DOUBLE PRECISION,
+    p_message TEXT,
+    p_details JSONB,
+    p_duration_ms INT,
+    p_error TEXT,
+    p_observed_at TIMESTAMPTZ DEFAULT now(),
+    p_recovery_performed BOOLEAN DEFAULT FALSE,
+    p_recovery_note TEXT DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_monitor monitors;
+    v_device devices;
+    v_state monitor_state;
+    v_alert alerts;
+    v_breaches INT;
+    v_oks INT;
+    v_alert_severity monitor_severity;
+    v_alert_id UUID := NULL;
+    v_resolved BOOLEAN := FALSE;
+BEGIN
+    SELECT * INTO v_device FROM devices
+    WHERE id = p_device_id AND enrollment_status = 'enrolled';
+    IF NOT FOUND THEN RAISE EXCEPTION 'device_not_authorized'; END IF;
+
+    SELECT * INTO v_monitor FROM monitors
+    WHERE id = p_monitor_id AND enabled;
+    IF NOT FOUND THEN RAISE EXCEPTION 'monitor_not_found'; END IF;
+
+    IF v_monitor.organization_id <> v_device.organization_id THEN
+        RAISE EXCEPTION 'monitor_device_org_mismatch';
+    END IF;
+    -- Enforce scope server-side: a device cannot report on a monitor that does
+    -- not target it, even if it knows the id.
+    IF v_monitor.device_id IS NOT NULL AND v_monitor.device_id <> p_device_id THEN
+        RAISE EXCEPTION 'monitor_not_in_scope';
+    END IF;
+    IF v_monitor.group_id IS NOT NULL
+       AND NOT rmm_device_matches_group(p_device_id, v_monitor.group_id) THEN
+        RAISE EXCEPTION 'monitor_not_in_scope';
+    END IF;
+
+    IF p_observed_at > now() + interval '1 hour'
+       OR p_observed_at < now() - interval '7 days' THEN
+        RAISE EXCEPTION 'invalid_observed_at';
+    END IF;
+
+    INSERT INTO monitor_results
+        (organization_id, monitor_id, device_id, status, value, message, details,
+         duration_ms, error, observed_at)
+    VALUES
+        (v_monitor.organization_id, p_monitor_id, p_device_id, p_status,
+         CASE WHEN p_value = 'NaN'::DOUBLE PRECISION OR p_value IN ('Infinity'::DOUBLE PRECISION, '-Infinity'::DOUBLE PRECISION)
+              THEN NULL ELSE p_value END,
+         LEFT(p_message, 2000),
+         CASE WHEN jsonb_typeof(p_details) = 'object' AND pg_column_size(p_details) <= 16384
+              THEN p_details ELSE '{}'::JSONB END,
+         LEAST(GREATEST(p_duration_ms, 0), 600000),
+         LEFT(p_error, 2000),
+         p_observed_at);
+
+    SELECT * INTO v_state FROM monitor_state
+    WHERE monitor_id = p_monitor_id AND device_id = p_device_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        INSERT INTO monitor_state (monitor_id, device_id, last_status, last_value, last_message, last_run_at)
+        VALUES (p_monitor_id, p_device_id, p_status, p_value, LEFT(p_message, 2000), p_observed_at)
+        RETURNING * INTO v_state;
+    END IF;
+
+    v_breaches := v_state.consecutive_breaches;
+    v_oks := v_state.consecutive_oks;
+
+    IF p_status IN ('warning', 'critical', 'error') THEN
+        v_breaches := v_breaches + 1;
+        v_oks := 0;
+    ELSIF p_status = 'ok' THEN
+        v_oks := v_oks + 1;
+        v_breaches := 0;
+    END IF;
+    -- 'unknown' leaves the counters unchanged: missing data must neither raise
+    -- nor clear an alert.
+
+    UPDATE monitor_state SET
+        last_status = p_status,
+        consecutive_breaches = v_breaches,
+        consecutive_oks = v_oks,
+        last_value = p_value,
+        last_message = LEFT(p_message, 2000),
+        last_run_at = p_observed_at,
+        updated_at = now()
+    WHERE monitor_id = p_monitor_id AND device_id = p_device_id;
+
+    IF p_status IN ('warning', 'critical', 'error') AND v_breaches >= v_monitor.breach_samples THEN
+        v_alert_severity := CASE
+            WHEN p_status = 'critical' THEN 'critical'::monitor_severity
+            ELSE v_monitor.severity
+        END;
+
+        SELECT * INTO v_alert FROM alerts
+        WHERE monitor_id = p_monitor_id AND device_id = p_device_id
+          AND status <> 'resolved'
+        FOR UPDATE;
+
+        IF FOUND THEN
+            UPDATE alerts SET
+                severity = v_alert_severity,
+                summary = LEFT(COALESCE(p_message, v_monitor.name), 500),
+                details = jsonb_build_object(
+                    'value', p_value,
+                    'status', p_status,
+                    'consecutive_breaches', v_breaches,
+                    'monitor_kind', v_monitor.kind,
+                    'error', LEFT(p_error, 2000)),
+                last_seen_at = p_observed_at
+            WHERE id = v_alert.id;
+            v_alert_id := v_alert.id;
+        ELSE
+            INSERT INTO alerts
+                (organization_id, device_id, monitor_id, severity, summary, details,
+                 first_seen_at, last_seen_at)
+            VALUES
+                (v_monitor.organization_id, p_device_id, p_monitor_id, v_alert_severity,
+                 LEFT(COALESCE(p_message, v_monitor.name), 500),
+                 jsonb_build_object(
+                    'value', p_value,
+                    'status', p_status,
+                    'consecutive_breaches', v_breaches,
+                    'monitor_kind', v_monitor.kind,
+                    'error', LEFT(p_error, 2000)),
+                 p_observed_at, p_observed_at)
+            RETURNING id INTO v_alert_id;
+
+            INSERT INTO alert_events (alert_id, event_type, actor_type, note)
+            VALUES (v_alert_id, 'opened', 'device', 'Threshold breached for ' || v_breaches || ' sample(s)');
+        END IF;
+
+    ELSIF p_status = 'ok' AND v_oks >= v_monitor.recovery_samples THEN
+        UPDATE alerts SET
+            status = 'resolved',
+            resolved_at = p_observed_at,
+            last_seen_at = p_observed_at
+        WHERE monitor_id = p_monitor_id AND device_id = p_device_id
+          AND status <> 'resolved'
+        RETURNING id INTO v_alert_id;
+
+        IF v_alert_id IS NOT NULL THEN
+            v_resolved := TRUE;
+            INSERT INTO alert_events (alert_id, event_type, actor_type, note)
+            VALUES (v_alert_id, 'resolved', 'device', 'Monitor recovered for '
+                    || v_oks || ' sample(s)');
+        END IF;
+    END IF;
+
+    IF p_recovery_performed THEN
+        INSERT INTO agent_health_events (organization_id, device_id, event_type, detail)
+        VALUES (v_monitor.organization_id, p_device_id, 'monitor.recovery',
+                LEFT(COALESCE(p_recovery_note, 'Automated recovery action'), 2000));
+        IF v_alert_id IS NOT NULL THEN
+            INSERT INTO alert_events (alert_id, event_type, actor_type, note)
+            VALUES (v_alert_id, 'recovery_attempted', 'device', LEFT(p_recovery_note, 2000));
+        END IF;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'ok', TRUE,
+        'monitor_id', p_monitor_id,
+        'alert_id', v_alert_id,
+        'alert_resolved', v_resolved,
+        'consecutive_breaches', v_breaches,
+        'consecutive_oks', v_oks);
+END;
+$$;
+
+-- ============================================================
+-- AGENT CONFIG / WORK POLLING
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_get_agent_config(p_device_id UUID)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_device devices;
+    v_settings organization_settings;
+BEGIN
+    SELECT * INTO v_device FROM devices
+    WHERE id = p_device_id AND enrollment_status = 'enrolled';
+    IF NOT FOUND THEN RAISE EXCEPTION 'device_not_authorized'; END IF;
+
+    SELECT * INTO v_settings FROM organization_settings
+    WHERE organization_id = v_device.organization_id;
+
+    RETURN jsonb_build_object(
+        'server_time', now(),
+        'settings', jsonb_build_object(
+            'metrics_interval_seconds', COALESCE(v_settings.metrics_interval_seconds, 60),
+            'inventory_interval_seconds', COALESCE(v_settings.inventory_interval_seconds, 21600),
+            'software_scan_interval_seconds', COALESCE(v_settings.software_scan_interval_seconds, 21600),
+            'event_scan_interval_seconds', COALESCE(v_settings.event_scan_interval_seconds, 300),
+            'allow_custom_powershell_monitors', COALESCE(v_settings.allow_custom_powershell_monitors, FALSE),
+            'allow_security_event_collection', COALESCE(v_settings.allow_security_event_collection, FALSE),
+            'allow_service_recovery', COALESCE(v_settings.allow_service_recovery, FALSE),
+            'service_recovery_cooldown_seconds', COALESCE(v_settings.service_recovery_cooldown_seconds, 600),
+            'max_event_bytes_per_scan', COALESCE(v_settings.max_event_bytes_per_scan, 1048576)
+        ),
+        'monitors', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+                'id', m.id,
+                'name', m.name,
+                'kind', m.kind,
+                'config', m.config,
+                'interval_seconds', m.interval_seconds,
+                'timeout_seconds', m.timeout_seconds,
+                'severity', m.severity,
+                'auto_recovery', m.auto_recovery,
+                'recovery_action', m.recovery_action,
+                'last_run_at', ms.last_run_at
+            ) ORDER BY m.name)
+            FROM monitors m
+            LEFT JOIN monitor_state ms
+                ON ms.monitor_id = m.id AND ms.device_id = p_device_id
+            WHERE m.organization_id = v_device.organization_id
+              AND m.enabled
+              AND (
+                    m.device_id = p_device_id
+                 OR (m.device_id IS NULL AND m.group_id IS NULL)
+                 OR (m.group_id IS NOT NULL AND rmm_device_matches_group(p_device_id, m.group_id))
+              )
+        ), '[]'::JSONB)
+    );
+END;
+$$;
+
+-- ============================================================
+-- DEPLOYMENT CLAIM / PROGRESS
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_maintenance_window_open(p_window JSONB, p_at TIMESTAMPTZ DEFAULT now())
+RETURNS BOOLEAN
+LANGUAGE plpgsql STABLE
+AS $$
+DECLARE
+    v_start TIME;
+    v_end TIME;
+    v_days INT[];
+    v_local TIMESTAMP;
+BEGIN
+    IF p_window IS NULL OR p_window = '{}'::JSONB THEN
+        RETURN TRUE;
+    END IF;
+
+    v_start := NULLIF(p_window ->> 'start', '')::TIME;
+    v_end := NULLIF(p_window ->> 'end', '')::TIME;
+    IF v_start IS NULL OR v_end IS NULL THEN
+        RETURN TRUE;
+    END IF;
+
+    -- Windows are evaluated in UTC. Time zone conversion is intentionally not
+    -- attempted here so behaviour is deterministic on the server.
+    v_local := p_at AT TIME ZONE 'UTC';
+
+    IF jsonb_typeof(p_window -> 'days') = 'array' THEN
+        SELECT array_agg((value)::INT) INTO v_days
+        FROM jsonb_array_elements_text(p_window -> 'days') AS value;
+        IF v_days IS NOT NULL AND NOT (EXTRACT(ISODOW FROM v_local)::INT = ANY (v_days)) THEN
+            RETURN FALSE;
+        END IF;
+    END IF;
+
+    IF v_start <= v_end THEN
+        RETURN v_local::TIME >= v_start AND v_local::TIME <= v_end;
+    ELSE
+        -- Overnight window, e.g. 22:00 → 02:00.
+        RETURN v_local::TIME >= v_start OR v_local::TIME <= v_end;
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rmm_deployment_targets(p_policy_id UUID)
+RETURNS SETOF UUID
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_policy deployment_policies;
+BEGIN
+    SELECT * INTO v_policy FROM deployment_policies WHERE id = p_policy_id;
+    IF NOT FOUND THEN RETURN; END IF;
+
+    IF v_policy.target_type = 'device' THEN
+        RETURN QUERY SELECT d.id FROM devices d
+        WHERE d.id = v_policy.target_device_id AND d.enrollment_status = 'enrolled';
+    ELSE
+        RETURN QUERY SELECT g.id FROM rmm_group_device_ids(v_policy.target_group_id) AS g;
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rmm_claim_deployment(p_device_id UUID)
+RETURNS TABLE (
+    job_id UUID,
+    package_version_id UUID,
+    operation deployment_operation,
+    attempt_number INT,
+    package_name TEXT,
+    package_format package_format,
+    version TEXT,
+    storage_path TEXT,
+    sha256 TEXT,
+    file_size_bytes BIGINT,
+    install_args TEXT,
+    uninstall_args TEXT,
+    repair_args TEXT,
+    detection_rules JSONB,
+    prerequisites JSONB,
+    signature_subject TEXT,
+    requires_reboot BOOLEAN,
+    timeout_seconds INT
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_device devices;
+    v_job deployment_jobs;
+    v_version software_package_versions;
+    v_package software_packages;
+    v_policy deployment_policies;
+    v_active INT;
+    v_limit INT;
+BEGIN
+    SELECT * INTO v_device FROM devices
+    WHERE id = p_device_id AND enrollment_status = 'enrolled';
+    IF NOT FOUND THEN RAISE EXCEPTION 'device_not_authorized'; END IF;
+
+    -- A job stuck in an active phase for two hours means the agent stopped
+    -- reporting (crash, power loss, uninstall). Fail it explicitly instead of
+    -- leaving it in-flight forever; it is never silently re-run.
+    UPDATE deployment_jobs SET
+        state = 'failed',
+        error_summary = 'Agent stopped reporting during execution; outcome unknown',
+        completed_at = now()
+    WHERE device_id = p_device_id
+      AND state IN ('downloading', 'validating', 'installing', 'verifying')
+      AND claimed_at < now() - interval '2 hours';
+
+    SELECT dj.* INTO v_job
+    FROM deployment_jobs dj
+    LEFT JOIN deployment_policies dp ON dp.id = dj.policy_id
+    WHERE dj.device_id = p_device_id
+      AND dj.state IN ('pending', 'queued')
+      AND COALESCE(dj.scheduled_for, now()) <= now()
+      AND (dp.id IS NULL OR dp.enabled)
+      AND (dp.id IS NULL OR rmm_maintenance_window_open(dp.maintenance_window))
+    ORDER BY dj.created_at ASC
+    LIMIT 1
+    FOR UPDATE OF dj SKIP LOCKED;
+
+    IF v_job IS NULL THEN RETURN; END IF;
+
+    SELECT * INTO v_version FROM software_package_versions
+    WHERE id = v_job.package_version_id;
+    IF v_version IS NULL OR v_version.approval_status <> 'approved' THEN
+        UPDATE deployment_jobs SET
+            state = 'blocked',
+            error_summary = 'Package version is not approved for deployment',
+            completed_at = now()
+        WHERE id = v_job.id;
+        RETURN;
+    END IF;
+
+    SELECT * INTO v_package FROM software_packages WHERE id = v_version.package_id;
+    IF v_job.policy_id IS NOT NULL THEN
+        SELECT * INTO v_policy FROM deployment_policies WHERE id = v_job.policy_id;
+        v_limit := LEAST(COALESCE(v_policy.concurrency_limit, 5),
+                         (SELECT deployment_concurrency_limit FROM organization_settings
+                           WHERE organization_id = v_device.organization_id)::INT);
+    ELSE
+        SELECT deployment_concurrency_limit INTO v_limit FROM organization_settings
+        WHERE organization_id = v_device.organization_id;
+    END IF;
+
+    SELECT COUNT(*) INTO v_active FROM deployment_jobs
+    WHERE organization_id = v_device.organization_id
+      AND state IN ('downloading', 'validating', 'installing', 'verifying');
+
+    IF v_active >= COALESCE(v_limit, 5) THEN
+        RETURN; -- rollout concurrency reached; try again later
+    END IF;
+
+    UPDATE deployment_jobs SET
+        state = 'downloading',
+        progress = 10,
+        attempts = attempts + 1,
+        claimed_at = now(),
+        started_at = COALESCE(started_at, now()),
+        error_summary = NULL
+    WHERE id = v_job.id
+    RETURNING * INTO v_job;
+
+    INSERT INTO deployment_attempts (job_id, attempt_number, state)
+    VALUES (v_job.id, v_job.attempts, 'downloading')
+    ON CONFLICT ON CONSTRAINT deployment_attempts_job_id_attempt_number_key DO UPDATE SET
+        state = EXCLUDED.state,
+        started_at = now();
+
+    RETURN QUERY SELECT
+        v_job.id,
+        v_version.id,
+        v_job.operation,
+        v_job.attempts,
+        v_package.name,
+        v_version.package_format,
+        v_version.version,
+        v_version.storage_path,
+        v_version.sha256,
+        v_version.file_size_bytes,
+        CASE v_job.operation
+            WHEN 'uninstall' THEN COALESCE(v_version.uninstall_args, v_version.install_args)
+            WHEN 'repair' THEN COALESCE(v_version.repair_args, v_version.install_args)
+            ELSE v_version.install_args
+        END,
+        v_version.uninstall_args,
+        v_version.repair_args,
+        v_version.detection_rules,
+        v_version.prerequisites,
+        v_version.signature_subject,
+        v_version.requires_reboot,
+        LEAST(GREATEST(v_job.max_attempts, 1) * 600, 3600);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rmm_update_deployment(
+    p_device_id UUID,
+    p_job_id UUID,
+    p_state deployment_state,
+    p_progress INT DEFAULT NULL,
+    p_exit_code INT DEFAULT NULL,
+    p_output TEXT DEFAULT NULL,
+    p_error TEXT DEFAULT NULL,
+    p_reboot_required BOOLEAN DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_job deployment_jobs;
+    v_terminal BOOLEAN;
+    v_terminal_states deployment_state[] := ARRAY[
+        'succeeded', 'failed', 'cancelled', 'expired', 'reboot_required', 'blocked'
+    ]::deployment_state[];
+BEGIN
+    SELECT * INTO v_job FROM deployment_jobs
+    WHERE id = p_job_id AND device_id = p_device_id
+    FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'deployment_not_found'; END IF;
+
+    -- A terminal job cannot be resurrected by a late/duplicate agent report.
+    IF v_job.state = ANY (v_terminal_states) THEN
+        RETURN jsonb_build_object('ok', FALSE, 'reason', 'already_terminal', 'state', v_job.state);
+    END IF;
+
+    v_terminal := p_state = ANY (v_terminal_states);
+
+    UPDATE deployment_jobs SET
+        state = p_state,
+        progress = CASE
+            WHEN p_state = 'succeeded' OR p_state = 'reboot_required' THEN 100
+            WHEN p_progress IS NOT NULL THEN LEAST(GREATEST(p_progress, 0), 100)
+            ELSE progress
+        END,
+        exit_code = COALESCE(p_exit_code, exit_code),
+        stdout_text = CASE WHEN p_output IS NULL THEN stdout_text
+                           ELSE LEFT(p_output, 65536) END,
+        error_summary = COALESCE(LEFT(p_error, 2000), error_summary),
+        reboot_required = COALESCE(p_reboot_required, reboot_required),
+        completed_at = CASE WHEN v_terminal THEN now() ELSE completed_at END
+    WHERE id = p_job_id;
+
+    UPDATE deployment_attempts SET
+        state = p_state,
+        exit_code = COALESCE(p_exit_code, exit_code),
+        output = CASE WHEN p_output IS NULL THEN output ELSE LEFT(p_output, 32768) END,
+        error_summary = COALESCE(LEFT(p_error, 2000), error_summary),
+        completed_at = CASE WHEN v_terminal THEN now() ELSE completed_at END
+    WHERE job_id = p_job_id AND attempt_number = v_job.attempts;
+
+    -- Confirmed software changes from a succeeded management job.
+    IF p_state IN ('succeeded', 'reboot_required') AND v_job.operation IN ('install', 'update', 'repair', 'uninstall', 'rollback') THEN
+        INSERT INTO software_change_events
+            (organization_id, device_id, change_type, product_key, name,
+             from_version, to_version, source, deployment_job_id, actor_user_id)
+        SELECT
+            v_job.organization_id,
+            v_job.device_id,
+            CASE WHEN v_job.operation = 'uninstall' THEN 'removed'::software_change_type
+                 WHEN v_job.operation = 'update' THEN 'updated'::software_change_type
+                 ELSE 'installed'::software_change_type END,
+            LEFT(sp.name || '|' || COALESCE(sp.publisher, '') || '|' || spv.architecture, 400),
+            sp.name,
+            NULL,
+            spv.version,
+            'confirmed',
+            v_job.id,
+            v_job.requested_by
+        FROM software_package_versions spv
+        JOIN software_packages sp ON sp.id = spv.package_id
+        WHERE spv.id = v_job.package_version_id;
+    END IF;
+
+    RETURN jsonb_build_object('ok', TRUE, 'state', p_state);
+END;
+$$;
+
+-- ============================================================
+-- HEARTBEAT FAILURE / OFFLINE MAINTENANCE
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_mark_stale_devices(p_stale_seconds INT DEFAULT NULL)
+RETURNS INT
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_count INT := 0;
+    v_row RECORD;
+BEGIN
+    FOR v_row IN
+        SELECT d.id, d.organization_id, d.last_heartbeat_at,
+               COALESCE(s.offline_after_seconds, 300) AS threshold
+        FROM devices d
+        LEFT JOIN organization_settings s ON s.organization_id = d.organization_id
+        WHERE d.enrollment_status = 'enrolled'
+          AND d.service_status IS DISTINCT FROM 'offline'
+          AND d.last_heartbeat_at IS NOT NULL
+    LOOP
+        IF v_row.last_heartbeat_at < now() - make_interval(secs => COALESCE(p_stale_seconds, v_row.threshold)) THEN
+            UPDATE devices SET service_status = 'offline' WHERE id = v_row.id;
+            INSERT INTO agent_health_events (organization_id, device_id, event_type, detail)
+            VALUES (v_row.organization_id, v_row.id, 'agent.offline',
+                    'No heartbeat for ' || EXTRACT(EPOCH FROM (now() - v_row.last_heartbeat_at))::INT || ' seconds');
+            v_count := v_count + 1;
+        END IF;
+    END LOOP;
+    RETURN v_count;
+END;
+$$;
+
+-- ============================================================
+-- HEALTH SCORE
+-- ============================================================
+CREATE OR REPLACE FUNCTION device_health_score(p_device_id UUID)
+RETURNS JSONB
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_device devices;
+    v_inv device_inventory;
+    v_settings organization_settings;
+    v_open_critical INT := 0;
+    v_open_warning INT := 0;
+    v_failed_monitors INT := 0;
+    v_total_monitors INT := 0;
+    v_low_disk BOOLEAN := FALSE;
+    v_pending_reboot BOOLEAN := FALSE;
+    v_heartbeat_age INT;
+    v_offline_after INT := 300;
+    v_earned NUMERIC := 0;
+    v_known NUMERIC := 0;
+    v_total NUMERIC := 0;
+    v_factors JSONB := '[]'::JSONB;
+    v_score NUMERIC;
+    v_confidence NUMERIC;
+BEGIN
+    SELECT * INTO v_device FROM devices WHERE id = p_device_id;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+
+    SELECT * INTO v_settings FROM organization_settings
+    WHERE organization_id = v_device.organization_id;
+    v_offline_after := COALESCE(v_settings.offline_after_seconds, 300);
+
+    SELECT * INTO v_inv FROM device_inventory WHERE device_id = p_device_id;
+
+    SELECT COUNT(*) FILTER (WHERE severity = 'critical'),
+           COUNT(*) FILTER (WHERE severity = 'warning')
+    INTO v_open_critical, v_open_warning
+    FROM alerts
+    WHERE device_id = p_device_id AND status <> 'resolved';
+
+    SELECT COUNT(*) FILTER (WHERE ms.last_status IN ('warning', 'critical')),
+           COUNT(*)
+    INTO v_failed_monitors, v_total_monitors
+    FROM monitor_state ms
+    JOIN monitors m ON m.id = ms.monitor_id
+    WHERE ms.device_id = p_device_id AND m.enabled;
+
+    IF v_inv IS NOT NULL AND jsonb_typeof(v_inv.os -> 'disks') = 'array' THEN
+        SELECT EXISTS (
+            SELECT 1 FROM jsonb_array_elements(v_inv.os -> 'disks') d
+            WHERE COALESCE((d ->> 'used_percent')::NUMERIC, 0) >= 90
+        ) INTO v_low_disk;
+    END IF;
+
+    v_pending_reboot := COALESCE((v_inv.os ->> 'pending_reboot')::BOOLEAN, FALSE);
+
+    v_heartbeat_age := CASE WHEN v_device.last_heartbeat_at IS NULL THEN NULL
+        ELSE EXTRACT(EPOCH FROM (now() - v_device.last_heartbeat_at))::INT END;
+
+    -- Agent health (weight 30)
+    v_total := v_total + 30;
+    IF v_device.enrollment_status IN ('suspended', 'revoked') THEN
+        v_factors := v_factors || jsonb_build_object('key', 'agent', 'label', 'Agent health',
+            'status', 'critical', 'weight', 30, 'earned', 0,
+            'detail', 'Device is ' || v_device.enrollment_status);
+    ELSIF v_heartbeat_age IS NULL THEN
+        v_factors := v_factors || jsonb_build_object('key', 'agent', 'label', 'Agent health',
+            'status', 'unknown', 'weight', 30, 'earned', 0,
+            'detail', 'No heartbeat recorded');
+    ELSIF v_heartbeat_age > v_offline_after THEN
+        v_factors := v_factors || jsonb_build_object('key', 'agent', 'label', 'Agent health',
+            'status', 'critical', 'weight', 30, 'earned', 0,
+            'detail', 'Last heartbeat ' || v_heartbeat_age || 's ago');
+        v_known := v_known + 30;
+    ELSE
+        v_factors := v_factors || jsonb_build_object('key', 'agent', 'label', 'Agent health',
+            'status', 'ok', 'weight', 30, 'earned', 30,
+            'detail', 'Heartbeat ' || v_heartbeat_age || 's ago');
+        v_earned := v_earned + 30;
+        v_known := v_known + 30;
+    END IF;
+
+    -- Active alerts (weight 30)
+    v_total := v_total + 30;
+    IF v_open_critical > 0 THEN
+        v_factors := v_factors || jsonb_build_object('key', 'alerts', 'label', 'Active alerts',
+            'status', 'critical', 'weight', 30, 'earned', 0,
+            'detail', v_open_critical || ' critical, ' || v_open_warning || ' warning');
+        v_known := v_known + 30;
+    ELSIF v_open_warning > 0 THEN
+        v_factors := v_factors || jsonb_build_object('key', 'alerts', 'label', 'Active alerts',
+            'status', 'warning', 'weight', 30, 'earned', 15,
+            'detail', v_open_warning || ' warning alert(s)');
+        v_earned := v_earned + 15;
+        v_known := v_known + 30;
+    ELSE
+        v_factors := v_factors || jsonb_build_object('key', 'alerts', 'label', 'Active alerts',
+            'status', 'ok', 'weight', 30, 'earned', 30, 'detail', 'No open alerts');
+        v_earned := v_earned + 30;
+        v_known := v_known + 30;
+    END IF;
+
+    -- Monitor results (weight 20)
+    v_total := v_total + 20;
+    IF v_total_monitors = 0 THEN
+        v_factors := v_factors || jsonb_build_object('key', 'monitors', 'label', 'Monitors',
+            'status', 'unknown', 'weight', 20, 'earned', 0,
+            'detail', 'No monitor results reported');
+    ELSE
+        v_known := v_known + 20;
+        IF v_failed_monitors > 0 THEN
+            v_factors := v_factors || jsonb_build_object('key', 'monitors', 'label', 'Monitors',
+                'status', 'warning', 'weight', 20, 'earned', 0,
+                'detail', v_failed_monitors || ' of ' || v_total_monitors || ' monitors failing');
+        ELSE
+            v_factors := v_factors || jsonb_build_object('key', 'monitors', 'label', 'Monitors',
+                'status', 'ok', 'weight', 20, 'earned', 20,
+                'detail', v_total_monitors || ' monitor(s) healthy');
+            v_earned := v_earned + 20;
+        END IF;
+    END IF;
+
+    -- Disk pressure (weight 10)
+    v_total := v_total + 10;
+    IF v_inv IS NULL THEN
+        v_factors := v_factors || jsonb_build_object('key', 'storage', 'label', 'Storage',
+            'status', 'unknown', 'weight', 10, 'earned', 0,
+            'detail', 'No inventory collected');
+    ELSE
+        v_known := v_known + 10;
+        IF v_low_disk THEN
+            v_factors := v_factors || jsonb_build_object('key', 'storage', 'label', 'Storage',
+                'status', 'warning', 'weight', 10, 'earned', 0,
+                'detail', 'A volume is at or above 90% used');
+        ELSE
+            v_factors := v_factors || jsonb_build_object('key', 'storage', 'label', 'Storage',
+                'status', 'ok', 'weight', 10, 'earned', 10, 'detail', 'No volume above 90% used');
+            v_earned := v_earned + 10;
+        END IF;
+    END IF;
+
+    -- Patch / reboot state (weight 10)
+    v_total := v_total + 10;
+    IF v_inv IS NULL OR v_inv.os ->> 'pending_reboot' IS NULL THEN
+        v_factors := v_factors || jsonb_build_object('key', 'patching', 'label', 'Patch state',
+            'status', 'unknown', 'weight', 10, 'earned', 0,
+            'detail', 'Patch/reboot state not reported');
+    ELSE
+        v_known := v_known + 10;
+        IF v_pending_reboot THEN
+            v_factors := v_factors || jsonb_build_object('key', 'patching', 'label', 'Patch state',
+                'status', 'warning', 'weight', 10, 'earned', 0,
+                'detail', 'A reboot is pending');
+        ELSE
+            v_factors := v_factors || jsonb_build_object('key', 'patching', 'label', 'Patch state',
+                'status', 'ok', 'weight', 10, 'earned', 10,
+                'detail', 'No pending reboot');
+            v_earned := v_earned + 10;
+        END IF;
+    END IF;
+
+    -- A score is only meaningful when the agent has checked in. Otherwise an
+    -- offline endpoint with no telemetry would appear healthy on the strength
+    -- of "no alerts", which is exactly the failure mode this score must avoid.
+    IF v_known > 0 AND v_heartbeat_age IS NOT NULL
+       AND v_device.enrollment_status = 'enrolled' THEN
+        v_score := ROUND(100 * v_earned / v_known);
+    ELSE
+        v_score := NULL;
+    END IF;
+    v_confidence := ROUND(100 * v_known / v_total);
+
+    RETURN jsonb_build_object(
+        'score', v_score,
+        'confidence', v_confidence,
+        'known_weight', v_known,
+        'total_weight', v_total,
+        'factors', v_factors,
+        'calculated_at', now()
+    );
+END;
+$$;
+
+-- ============================================================
+-- RETENTION
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_apply_retention(p_organization_id UUID DEFAULT NULL)
+RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_metrics INT := 0;
+    v_results INT := 0;
+    v_events INT := 0;
+    v_inv_snapshots INT := 0;
+    v_deploy_output INT := 0;
+    v_settings organization_settings;
+BEGIN
+    FOR v_settings IN
+        SELECT * FROM organization_settings
+        WHERE p_organization_id IS NULL OR organization_id = p_organization_id
+    LOOP
+        DELETE FROM device_metrics
+        WHERE organization_id = v_settings.organization_id
+          AND collected_at < now() - make_interval(days => v_settings.metrics_retention_days);
+        GET DIAGNOSTICS v_metrics = ROW_COUNT;
+
+        DELETE FROM monitor_results
+        WHERE organization_id = v_settings.organization_id
+          AND observed_at < now() - make_interval(days => v_settings.monitor_results_retention_days);
+
+        DELETE FROM device_events
+        WHERE organization_id = v_settings.organization_id
+          AND received_at < now() - make_interval(days => v_settings.event_retention_days);
+
+        DELETE FROM device_inventory_snapshots
+        WHERE organization_id = v_settings.organization_id
+          AND created_at < now() - interval '365 days';
+
+        UPDATE deployment_jobs SET
+            stdout_text = NULL,
+            stderr_text = NULL
+        WHERE organization_id = v_settings.organization_id
+          AND completed_at IS NOT NULL
+          AND completed_at < now() - make_interval(days => v_settings.deployment_output_retention_days)
+          AND (stdout_text IS NOT NULL OR stderr_text IS NOT NULL);
+        GET DIAGNOSTICS v_deploy_output = ROW_COUNT;
+
+        UPDATE deployment_attempts da SET output = NULL
+        FROM deployment_jobs dj
+        WHERE da.job_id = dj.id
+          AND dj.organization_id = v_settings.organization_id
+          AND dj.completed_at IS NOT NULL
+          AND dj.completed_at < now() - make_interval(days => v_settings.deployment_output_retention_days)
+          AND da.output IS NOT NULL;
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'metrics_deleted', v_metrics,
+        'monitor_results_deleted', v_results,
+        'events_deleted', v_events,
+        'deployment_output_cleared', v_deploy_output);
+END;
+$$;
+
+-- ============================================================
+-- ROW LEVEL SECURITY
+-- ============================================================
+ALTER TABLE device_groups               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE device_group_members        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE device_inventory            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE device_inventory_snapshots  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE device_metrics              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE monitors                    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE monitor_state               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE monitor_results             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alerts                      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE alert_events                ENABLE ROW LEVEL SECURITY;
+ALTER TABLE device_events               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_health_events         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE device_software             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE software_change_events      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE software_packages           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE software_package_versions   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deployment_policies         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deployment_jobs             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deployment_attempts         ENABLE ROW LEVEL SECURITY;
+
+-- Helper: the organisation of a device group.
+CREATE OR REPLACE FUNCTION auth_group_org(p_group_id UUID)
+RETURNS UUID LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+    SELECT organization_id FROM device_groups WHERE id = p_group_id;
+$$;
+
+-- Read policies for organisation members.
+CREATE POLICY groups_select ON device_groups FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY groups_write ON device_groups FOR ALL TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'))
+    WITH CHECK (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'));
+
+CREATE POLICY group_members_select ON device_group_members FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(auth_group_org(group_id), 'auditor'));
+CREATE POLICY group_members_write ON device_group_members FOR ALL TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(auth_group_org(group_id), 'administrator'))
+    WITH CHECK (NOT auth_is_device() AND auth_has_role(auth_group_org(group_id), 'administrator'));
+
+CREATE POLICY inventory_select ON device_inventory FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY inventory_snapshots_select ON device_inventory_snapshots FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY metrics_select ON device_metrics FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+
+CREATE POLICY monitors_select ON monitors FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY monitors_write ON monitors FOR ALL TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'))
+    WITH CHECK (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'));
+
+CREATE POLICY monitor_state_select ON monitor_state FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND EXISTS (
+        SELECT 1 FROM monitors m WHERE m.id = monitor_id
+          AND auth_has_role(m.organization_id, 'auditor')));
+CREATE POLICY monitor_results_select ON monitor_results FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+
+CREATE POLICY alerts_select ON alerts FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY alerts_update ON alerts FOR UPDATE TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'))
+    WITH CHECK (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'));
+
+CREATE POLICY alert_events_select ON alert_events FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND EXISTS (
+        SELECT 1 FROM alerts a WHERE a.id = alert_id
+          AND auth_has_role(a.organization_id, 'auditor')));
+
+CREATE POLICY device_events_select ON device_events FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY agent_health_select ON agent_health_events FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+
+CREATE POLICY software_select ON device_software FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY software_changes_select ON software_change_events FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+
+CREATE POLICY packages_select ON software_packages FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY packages_write ON software_packages FOR ALL TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'))
+    WITH CHECK (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'));
+
+CREATE POLICY package_versions_select ON software_package_versions FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY package_versions_write ON software_package_versions FOR ALL TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'))
+    WITH CHECK (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'));
+
+CREATE POLICY deployment_policies_select ON deployment_policies FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY deployment_policies_write ON deployment_policies FOR ALL TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'))
+    WITH CHECK (NOT auth_is_device() AND auth_has_role(organization_id, 'administrator'));
+
+CREATE POLICY deployment_jobs_select ON deployment_jobs FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'auditor'));
+CREATE POLICY deployment_jobs_write ON deployment_jobs FOR ALL TO authenticated
+    USING (NOT auth_is_device() AND auth_has_role(organization_id, 'operator'))
+    WITH CHECK (NOT auth_is_device() AND auth_has_role(organization_id, 'operator'));
+
+CREATE POLICY deployment_attempts_select ON deployment_attempts FOR SELECT TO authenticated
+    USING (NOT auth_is_device() AND EXISTS (
+        SELECT 1 FROM deployment_jobs dj WHERE dj.id = job_id
+          AND auth_has_role(dj.organization_id, 'auditor')));
+
+-- ============================================================
+-- ADMIN OPERATIONS (called from dashboard APIs with service role)
+-- ============================================================
+CREATE OR REPLACE FUNCTION rmm_acknowledge_alert(
+    p_alert_id UUID,
+    p_actor_user_id UUID,
+    p_org_id UUID,
+    p_note TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM organization_members
+        WHERE organization_id = p_org_id AND user_id = p_actor_user_id
+          AND role IN ('owner', 'administrator', 'operator')
+    ) THEN
+        RAISE EXCEPTION 'forbidden';
+    END IF;
+
+    UPDATE alerts SET
+        status = 'acknowledged',
+        acknowledged_at = now(),
+        acknowledged_by = p_actor_user_id
+    WHERE id = p_alert_id AND organization_id = p_org_id AND status = 'open';
+
+    IF NOT FOUND THEN RETURN FALSE; END IF;
+
+    INSERT INTO alert_events (alert_id, event_type, actor_type, actor_id, note)
+    VALUES (p_alert_id, 'acknowledged', 'user', p_actor_user_id, LEFT(p_note, 2000));
+
+    INSERT INTO audit_events (organization_id, actor_type, actor_id, action, target_type, target_id, metadata)
+    VALUES (p_org_id, 'user', p_actor_user_id, 'alert.acknowledged', 'alert', p_alert_id,
+            jsonb_build_object('note', LEFT(p_note, 500)));
+    RETURN TRUE;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rmm_resolve_alert(
+    p_alert_id UUID,
+    p_actor_user_id UUID,
+    p_org_id UUID,
+    p_note TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM organization_members
+        WHERE organization_id = p_org_id AND user_id = p_actor_user_id
+          AND role IN ('owner', 'administrator', 'operator')
+    ) THEN
+        RAISE EXCEPTION 'forbidden';
+    END IF;
+
+    UPDATE alerts SET
+        status = 'resolved',
+        resolved_at = now(),
+        resolved_by = p_actor_user_id
+    WHERE id = p_alert_id AND organization_id = p_org_id AND status <> 'resolved';
+
+    IF NOT FOUND THEN RETURN FALSE; END IF;
+
+    INSERT INTO alert_events (alert_id, event_type, actor_type, actor_id, note)
+    VALUES (p_alert_id, 'resolved', 'user', p_actor_user_id, LEFT(p_note, 2000));
+
+    INSERT INTO audit_events (organization_id, actor_type, actor_id, action, target_type, target_id, metadata)
+    VALUES (p_org_id, 'user', p_actor_user_id, 'alert.resolved', 'alert', p_alert_id,
+            jsonb_build_object('note', LEFT(p_note, 500)));
+    RETURN TRUE;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rmm_cancel_deployment(
+    p_job_id UUID,
+    p_actor_user_id UUID,
+    p_org_id UUID
+)
+RETURNS TEXT
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_state deployment_state;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM organization_members
+        WHERE organization_id = p_org_id AND user_id = p_actor_user_id
+          AND role IN ('owner', 'administrator', 'operator')
+    ) THEN
+        RETURN 'forbidden';
+    END IF;
+
+    SELECT state INTO v_state FROM deployment_jobs
+    WHERE id = p_job_id AND organization_id = p_org_id FOR UPDATE;
+    IF NOT FOUND THEN RETURN 'not_found'; END IF;
+
+    IF v_state IN ('succeeded', 'failed', 'cancelled', 'expired', 'reboot_required', 'blocked') THEN
+        RETURN 'already_terminal';
+    END IF;
+
+    UPDATE deployment_jobs SET
+        state = 'cancelled',
+        completed_at = now(),
+        error_summary = 'Cancelled by administrator'
+    WHERE id = p_job_id;
+
+    UPDATE deployment_attempts SET
+        state = 'cancelled',
+        completed_at = now(),
+        error_summary = 'Cancelled by administrator'
+    WHERE job_id = p_job_id AND completed_at IS NULL;
+
+    INSERT INTO audit_events (organization_id, actor_type, actor_id, action, target_type, target_id)
+    VALUES (p_org_id, 'user', p_actor_user_id, 'deployment.cancelled', 'deployment_job', p_job_id);
+
+    RETURN 'ok';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION rmm_retry_deployment(
+    p_job_id UUID,
+    p_actor_user_id UUID,
+    p_org_id UUID
+)
+RETURNS TEXT
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_job deployment_jobs;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM organization_members
+        WHERE organization_id = p_org_id AND user_id = p_actor_user_id
+          AND role IN ('owner', 'administrator', 'operator')
+    ) THEN
+        RETURN 'forbidden';
+    END IF;
+
+    SELECT * INTO v_job FROM deployment_jobs
+    WHERE id = p_job_id AND organization_id = p_org_id FOR UPDATE;
+    IF NOT FOUND THEN RETURN 'not_found'; END IF;
+
+    IF v_job.state <> 'failed' THEN RETURN 'not_retryable'; END IF;
+    IF v_job.attempts >= v_job.max_attempts THEN RETURN 'attempts_exhausted'; END IF;
+
+    UPDATE deployment_jobs SET
+        state = 'queued',
+        progress = 0,
+        error_summary = NULL,
+        exit_code = NULL,
+        stdout_text = NULL,
+        stderr_text = NULL,
+        completed_at = NULL,
+        claimed_at = NULL,
+        scheduled_for = now()
+    WHERE id = p_job_id;
+
+    INSERT INTO audit_events (organization_id, actor_type, actor_id, action, target_type, target_id)
+    VALUES (p_org_id, 'user', p_actor_user_id, 'deployment.retried', 'deployment_job', p_job_id);
+
+    RETURN 'ok';
+END;
+$$;
+
+-- Permissions
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO authenticated, service_role;
+GRANT ALL ON ALL ROUTINES IN SCHEMA public TO authenticated, service_role;
+
+
