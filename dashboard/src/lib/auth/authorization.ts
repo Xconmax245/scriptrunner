@@ -64,28 +64,32 @@ export async function requireAdmin(organizationId?: string): Promise<AdminContex
   const user = await requireUser();
   const defaultOrgId = organizationId || process.env.NEXT_PUBLIC_DEFAULT_ORG_ID || "00000000-0000-0000-0000-000000000001";
 
-  const admin = createServiceClient();
-  let query = admin
-    .from("organization_members")
-    .select("organization_id, role, created_at")
-    .eq("user_id", user.id)
-    .in("role", ["owner", "administrator"]);
+  try {
+    const admin = createServiceClient();
+    let query = admin
+      .from("organization_members")
+      .select("organization_id, role, created_at")
+      .eq("user_id", user.id)
+      .in("role", ["owner", "administrator"]);
 
-  if (organizationId) {
-    query = query.eq("organization_id", organizationId);
-  }
+    if (organizationId) {
+      query = query.eq("organization_id", organizationId);
+    }
 
-  const { data } = await query.order("created_at", { ascending: true }).limit(1);
-  const membership = data?.[0] as
-    | { organization_id: string; role: AdminRole }
-    | undefined;
+    const { data } = await query.order("created_at", { ascending: true }).limit(1);
+    const membership = data?.[0] as
+      | { organization_id: string; role: AdminRole }
+      | undefined;
 
-  if (membership) {
-    return {
-      userId: user.id,
-      organizationId: membership.organization_id,
-      role: membership.role,
-    };
+    if (membership) {
+      return {
+        userId: user.id,
+        organizationId: membership.organization_id,
+        role: membership.role,
+      };
+    }
+  } catch (err) {
+    console.warn("requireAdmin query error (falling back to default org):", err);
   }
 
   return {

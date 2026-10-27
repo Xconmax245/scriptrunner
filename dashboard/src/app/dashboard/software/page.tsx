@@ -18,12 +18,18 @@ export default async function SoftwarePage({
   const supabase = createServiceClient();
 
   // Fetch enrolled devices
-  const { data: devices } = await supabase
-    .from("devices")
-    .select("id, hostname, display_name, operating_system, agent_version, last_seen_at, enrollment_status")
-    .eq("organization_id", admin.organizationId)
-    .eq("enrollment_status", "enrolled")
-    .order("hostname");
+  let devices: any[] = [];
+  try {
+    const { data } = await supabase
+      .from("devices")
+      .select("id, hostname, display_name, operating_system, agent_version, last_seen_at, enrollment_status")
+      .eq("organization_id", admin.organizationId)
+      .eq("enrollment_status", "enrolled")
+      .order("hostname");
+    devices = data ?? [];
+  } catch (err) {
+    console.warn("Software page device query error:", err);
+  }
 
   const now = Date.now();
   const enrolledDevices = (devices ?? []).map((d) => ({

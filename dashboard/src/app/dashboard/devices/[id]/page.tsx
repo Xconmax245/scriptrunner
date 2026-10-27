@@ -28,13 +28,21 @@ export default async function DeviceDetailPage({ params }: PageProps) {
   const supabase = createServiceClient();
   const user = await getAuthenticatedUser();
 
-  const { data: device, error: deviceError } = await supabase
-    .from("devices")
-    .select("*")
-    .eq("id", id)
-    .single();
+  let device: any = null;
+  try {
+    const { data, error } = await supabase
+      .from("devices")
+      .select("*")
+      .eq("id", id)
+      .single();
+    if (!error && data) {
+      device = data;
+    }
+  } catch (err) {
+    console.warn("Device detail query error:", err);
+  }
 
-  if (deviceError || !device) {
+  if (!device) {
     notFound();
   }
 
