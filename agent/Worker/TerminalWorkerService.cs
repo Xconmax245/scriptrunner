@@ -147,35 +147,7 @@ public sealed class TerminalWorkerService : BackgroundService
 
         var pumpTask = PumpOutputAsync(channel.Reader, claim.SessionId, stoppingToken);
 
-        // Send the command names PowerShell can resolve in this session so the
-        // dashboard can offer Tab completion. This is internal metadata: the UI
-        // strips it from the visible output.
-        try
-        {
-            string completionText = await session.CaptureOutputAsync(
-                "Get-Command -CommandType Cmdlet,Function,Alias | Select-Object -ExpandProperty Name | Sort-Object -Unique",
-                stoppingToken);
 
-            var names = completionText
-                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Where(n => n.Length > 0 && n.Length <= 80 && n.All(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_'))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(3000)
-                .ToArray();
-
-            foreach (var slice in names.Chunk(60))
-            {
-                channel.Writer.TryWrite(new TerminalOutputChunk
-                {
-                    Stream = "system",
-                    Content = "\u0001SR-COMPLETIONS\u0001" + System.Text.Json.JsonSerializer.Serialize(slice)
-                });
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug("Could not enumerate PowerShell commands for completion: {Message}", ex.Message);
-        }
 
         channel.Writer.TryWrite(SystemText(
             $"ScriptRunner remote terminal attached to {claim.Hostname} " +
@@ -253,6 +225,9 @@ public sealed class TerminalWorkerService : BackgroundService
                         channel.Writer.TryWrite(SystemText(
                             "\r\n[output truncated] Only part of this command's output was streamed.\r\n"));
                     }
+
+                    // Give output pump brief window to coalesce and send trailing chunks
+                    await Task.Delay(50, stoppingToken);
 
                     await _apiClient.ReportTerminalCommandResultAsync(
                         claim.SessionId, command.Sequence, outcome.ExitOk, outcome.Error, stoppingToken);

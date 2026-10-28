@@ -90,6 +90,23 @@ export function WorkingTerminal({ devices = [], initialDeviceId, embedded = fals
     scrollToBottom();
   }, [entries, executing, scrollToBottom]);
 
+  useEffect(() => {
+    if (devices.length > 0) {
+      if (initialDeviceId) {
+        const match = devices.find((d) => d.id === initialDeviceId);
+        if (match) {
+          setSelectedDevice(match);
+          return;
+        }
+      }
+      setSelectedDevice((prev) => {
+        if (!prev) return devices[0];
+        const match = devices.find((d) => d.id === prev.id);
+        return match || devices[0];
+      });
+    }
+  }, [devices, initialDeviceId]);
+
   // Initial welcome message
   useEffect(() => {
     const bannerEntry: CommandEntry = {

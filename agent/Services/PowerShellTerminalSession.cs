@@ -72,32 +72,7 @@ public sealed class PowerShellTerminalSession : IAsyncDisposable
 
     public static string ResolvePowerShellBinaryPath(AgentOptions options)
     {
-        if (!string.IsNullOrWhiteSpace(options.PowerShellPath) && File.Exists(options.PowerShellPath))
-        {
-            return options.PowerShellPath;
-        }
-
-        string[] candidates =
-        {
-            @"C:\Program Files\PowerShell\7\pwsh.exe",
-            @"C:\Program Files\PowerShell\pwsh.exe",
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                @"PowerShell\7\pwsh.exe")
-        };
-
-        foreach (var candidate in candidates)
-        {
-            if (File.Exists(candidate)) return candidate;
-        }
-
-        string winPs = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.System),
-            @"WindowsPowerShell\v1.0\powershell.exe");
-
-        if (File.Exists(winPs)) return winPs;
-
-        throw new FileNotFoundException("Could not find a PowerShell executable on this host.");
+        return PowerShellResolver.Resolve(options?.PowerShellPath);
     }
 
     private static string ResolveWorkingDirectory(AgentOptions options)
@@ -409,13 +384,20 @@ public sealed class PowerShellTerminalSession : IAsyncDisposable
         // Capture $? into a variable *before* writing the newline: writing the
         // newline is itself a successful statement and would otherwise reset $?.
         string trailer =
-            "$__sr_ok = $?; [Console]::Out.Write([Environment]::NewLine); Write-Output ('" + marker +
-            "' + $(if ($__sr_ok) { 'OK' } else { 'ERR' }))";
+            "$__sr_ok = $?; [Console]::Out.Write([Environment]::NewLine); Out-Default; Write-Output ('" + marker +
+            "' + $(if ($__sr_ok) { 'OK' } else { 'ERR' })); Out-Default; [Console]::Out.Flush()";
+
+        string normalized = command.Replace("\r\n", "\n").Replace("\r", "\n");
+        // Ensure standalone closing braces have an empty line after them so interactive stdin
+        // commits the block statement without waiting.
+        normalized = Regex.Replace(normalized, @"(?m)^\s*\}\s*$", "}\n");
 
         try
         {
-            _stdin.WriteLine(command);
+            _stdin.WriteLine(normalized);
             _stdin.WriteLine(trailer);
+            _stdin.WriteLine();
+            _stdin.Flush();
         }
         catch (Exception ex)
         {

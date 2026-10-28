@@ -8,6 +8,14 @@ import {
   getPendingDeploymentsCount,
   DeploymentState,
 } from "@/lib/rmm/deploymentStore";
+import {
+  terminalClaim,
+  terminalPoll,
+  terminalAppendOutput,
+  terminalCommandResult,
+  terminalState,
+  terminalCloseSession,
+} from "@/lib/terminal/terminalStore";
 
 export const dynamic = "force-dynamic";
 
@@ -529,67 +537,37 @@ export async function POST(req: NextRequest) {
 
       case "terminal_claim": {
         try {
-          const { data, error } = await admin.rpc("terminal_agent_claim", {
-            p_device_id: deviceId,
-            p_agent_instance: asString(body.agent_instance, 64),
+          const session = await terminalClaim(
+            deviceId,
+            identity.organizationId,
+            asString(body.hostname, 253) || device.hostname || "WINDOWS-PC",
+            asString(body.agent_instance, 64)
+          );
+          return json({
+            session: {
+              session_id: session.sessionId,
+              expires_at: session.expiresAt,
+              last_output_sequence: session.lastOutputSequence,
+              hostname: session.hostname,
+            },
           });
-          if (!error && data) {
-            const session = Array.isArray(data) ? data[0] : data;
-            if (session?.session_id) {
-              return json({
-                session: {
-                  session_id: session.session_id,
-                  expires_at: session.expires_at,
-                  last_output_sequence: Number(session.last_output_sequence ?? 0),
-                  hostname: session.hostname ?? device.hostname ?? "",
-                },
-              });
-            }
-          }
-        } catch {}
-        return json({ session: null });
+        } catch (err: any) {
+          console.error("terminal_claim error:", err);
+          return json({ session: null });
+        }
       }
 
       case "terminal_poll": {
         const sessionId = asUuid(body.session_id);
         if (!sessionId) return json({ error: "Invalid session" }, 422);
 
-        const deadline = Date.now() + POLL_WINDOW_MS;
-        let lastStatus = "active";
-        let lastReason: string | null = null;
-
-        do {
-          const { data, error } = await admin.rpc("terminal_agent_poll", {
-            p_session_id: sessionId,
-            p_device_id: deviceId,
-          });
-          if (error) return json({ error: error.message }, 500);
-
-          const rows = (data ?? []) as Array<Record<string, unknown>>;
-          const status = String(rows[0]?.session_status ?? "invalid");
-          lastStatus = status;
-          lastReason = (rows[0]?.close_reason as string | null) ?? null;
-
-          const commands = rows
-            .filter((row) => row.command_id)
-            .map((row) => ({
-              command_id: row.command_id,
-              sequence: Number(row.command_sequence),
-              command: String(row.command ?? ""),
-            }));
-
-          if (commands.length > 0 || !["pending", "active"].includes(status)) {
-            return json({
-              session_status: status,
-              close_reason: lastReason,
-              commands,
-            });
-          }
-
-          await delay(POLL_INTERVAL_MS);
-        } while (Date.now() < deadline);
-
-        return json({ session_status: lastStatus, close_reason: lastReason, commands: [] });
+        try {
+          const res = await terminalPoll(sessionId, deviceId, POLL_WINDOW_MS);
+          return json(res);
+        } catch (err: any) {
+          console.error("terminal_poll error:", err);
+          return json({ session_status: "active", close_reason: null, commands: [] });
+        }
       }
 
       case "terminal_output": {
@@ -609,19 +587,13 @@ export async function POST(req: NextRequest) {
           })
           .filter((item) => item.content.length > 0);
 
-        if (normalized.length === 0) return json({ session_status: "active", last_output_sequence: 0 });
-
-        const { data, error } = await admin.rpc("terminal_agent_append_output", {
-          p_session_id: sessionId,
-          p_device_id: deviceId,
-          p_items: normalized,
-        });
-        if (error) return json({ error: error.message }, 500);
-        const row = Array.isArray(data) ? data[0] : data;
-        return json({
-          session_status: row?.session_status ?? "active",
-          last_output_sequence: Number(row?.last_output_sequence ?? 0),
-        });
+        try {
+          const res = await terminalAppendOutput(sessionId, deviceId, normalized);
+          return json(res);
+        } catch (err: any) {
+          console.error("terminal_output error:", err);
+          return json({ session_status: "active", last_output_sequence: 0 });
+        }
       }
 
       case "terminal_command_result": {
@@ -629,44 +601,45 @@ export async function POST(req: NextRequest) {
         const sequence = Number(body.sequence);
         if (!sessionId || !Number.isFinite(sequence)) return json({ error: "Invalid command result" }, 422);
 
-        const { data, error } = await admin.rpc("terminal_agent_command_result", {
-          p_session_id: sessionId,
-          p_device_id: deviceId,
-          p_command_sequence: sequence,
-          p_exit_ok: Boolean(body.exit_ok),
-          p_error: asString(body.error, 1000) || null,
-        });
-        if (error) return json({ error: error.message }, 500);
-        return json({ success: Boolean(data) });
+        try {
+          const res = await terminalCommandResult(
+            sessionId,
+            deviceId,
+            sequence,
+            Boolean(body.exit_ok),
+            asString(body.error, 1000) || null
+          );
+          return json(res);
+        } catch (err: any) {
+          console.error("terminal_command_result error:", err);
+          return json({ success: false });
+        }
       }
 
       case "terminal_state": {
         const sessionId = asUuid(body.session_id);
         if (!sessionId) return json({ error: "Invalid session" }, 422);
-        const { data, error } = await admin
-          .from("terminal_sessions")
-          .select("status, close_reason")
-          .eq("id", sessionId)
-          .eq("device_id", deviceId)
-          .maybeSingle();
-        if (error) return json({ error: error.message }, 500);
-        return json({
-          session_status: data?.status ?? "invalid",
-          close_reason: data?.close_reason ?? null,
-        });
+        try {
+          const res = await terminalState(sessionId, deviceId);
+          return json(res);
+        } catch (err: any) {
+          return json({ session_status: "invalid", close_reason: err.message });
+        }
       }
 
       case "terminal_end": {
         const sessionId = asUuid(body.session_id);
         if (!sessionId) return json({ error: "Invalid session" }, 422);
-        const { data, error } = await admin.rpc("terminal_close_session", {
-          p_session_id: sessionId,
-          p_actor: null,
-          p_reason: asString(body.reason, 500) || "Session ended by agent",
-          p_device_id: deviceId,
-        });
-        if (error) return json({ error: error.message }, 500);
-        return json({ result: data });
+        try {
+          const res = await terminalCloseSession(
+            sessionId,
+            deviceId,
+            asString(body.reason, 500) || "Session ended by agent"
+          );
+          return json(res);
+        } catch (err: any) {
+          return json({ ok: false });
+        }
       }
 
       default:

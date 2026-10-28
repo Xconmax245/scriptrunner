@@ -60,6 +60,10 @@ tests/db/
 dashboard/test_assets/
 dashboard/data/packages/
 dashboard/data/rmm/
+dashboard/data/*.json
+agent_publish/
+*.pdb
+agent_stderr.txt
 
 # Binaries & Published Executables
 /appsettings.json

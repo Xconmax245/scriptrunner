@@ -34,42 +34,7 @@ public class JobExecutionEngine : IJobExecutionEngine
 
     private string ResolvePowerShellBinaryPath()
     {
-        // 1. Explicitly configured path
-        if (!string.IsNullOrEmpty(_options.PowerShellPath) && File.Exists(_options.PowerShellPath))
-        {
-            _logger.LogInformation("Using configured PowerShell binary: {Path}", _options.PowerShellPath);
-            return _options.PowerShellPath;
-        }
-
-        // 2. PowerShell 7 (pwsh.exe) in standard Program Files locations
-        string[] pwshCandidates = new[]
-        {
-            @"C:\Program Files\PowerShell\7\pwsh.exe",
-            @"C:\Program Files\PowerShell\pwsh.exe",
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"PowerShell\7\pwsh.exe"),
-        };
-
-        foreach (var candidate in pwshCandidates)
-        {
-            if (File.Exists(candidate))
-            {
-                _logger.LogInformation("Discovered PowerShell Core binary: {Path}", candidate);
-                return candidate;
-            }
-        }
-
-        // 3. Fallback to Windows PowerShell 5.1 with absolute system path (avoids PATH hijacking)
-        string winPs = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.System),
-            @"WindowsPowerShell\v1.0\powershell.exe");
-
-        if (File.Exists(winPs))
-        {
-            _logger.LogInformation("Using Windows PowerShell binary: {Path}", winPs);
-            return winPs;
-        }
-
-        throw new FileNotFoundException("Could not find a valid PowerShell executable on the host system.");
+        return PowerShellResolver.Resolve(_options.PowerShellPath, _logger);
     }
 
     public async Task<ExecutionResult> ExecuteScriptAsync(
