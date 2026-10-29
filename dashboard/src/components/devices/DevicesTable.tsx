@@ -290,6 +290,9 @@ export function DevicesTable({ devices, canManage }: Props) {
                           deviceId={device.id}
                           deviceName={device.display_name}
                           status={device.enrollment_status}
+                          hostname={device.hostname}
+                          operatingSystem={device.operating_system}
+                          agentVersion={device.agent_version}
                         />
                       </>
                     ) : (

@@ -163,6 +163,9 @@ export default async function DeviceDetailPage({ params }: PageProps) {
                   deviceId={device.id}
                   deviceName={device.display_name}
                   status={device.enrollment_status}
+                  hostname={device.hostname}
+                  operatingSystem={device.operating_system}
+                  agentVersion={device.agent_version}
                 />
               ) : (
                 <Link href="/auth/sign-in" className="btn btn-secondary btn-sm">

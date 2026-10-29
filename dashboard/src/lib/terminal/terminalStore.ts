@@ -423,6 +423,26 @@ export async function terminalCloseSession(
 }
 
 /**
+ * Close all active or pending terminal sessions associated with a device.
+ */
+export async function terminalCloseDeviceSessions(
+  deviceId: string,
+  reason = "Device status changed"
+): Promise<void> {
+  await loadSessions();
+  for (const session of sessions.values()) {
+    if (session.deviceId === deviceId && (session.status === "active" || session.status === "pending")) {
+      session.status = "closed";
+      session.closeReason = reason;
+      const waiters = pollWaiters.get(session.sessionId) || [];
+      for (const w of waiters) w();
+      pollWaiters.delete(session.sessionId);
+    }
+  }
+  await persistSessions();
+}
+
+/**
  * Execute command on target Windows agent:
  * 1. Checks device enrollment.
  * 2. Attempts execution via persistent TerminalWorkerService on target Windows endpoint.

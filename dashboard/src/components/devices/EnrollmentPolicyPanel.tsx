@@ -47,6 +47,8 @@ export function EnrollmentPolicyPanel({ organizationId }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [unauthorized, setUnauthorized] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [confirmingKeyId, setConfirmingKeyId] = useState<string | null>(null);
+  const [revokingKeyId, setRevokingKeyId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -135,16 +137,21 @@ export function EnrollmentPolicyPanel({ organizationId }: Props) {
   };
 
   const revokeKey = async (id: string) => {
-    if (!window.confirm("Revoke this enrollment key? Existing devices keep working; new installs cannot enroll with it.")) {
-      return;
+    setRevokingKeyId(id);
+    try {
+      const response = await fetch(`/api/enrollment-keys/${id}/revoke`, { method: "POST" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        setError(payload.error ?? "Failed to revoke key");
+        return;
+      }
+      setConfirmingKeyId(null);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to revoke key");
+    } finally {
+      setRevokingKeyId(null);
     }
-    const response = await fetch(`/api/enrollment-keys/${id}/revoke`, { method: "POST" });
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      setError(payload.error ?? "Failed to revoke key");
-      return;
-    }
-    await load();
   };
 
   const copyText = async (text: string) => {
@@ -157,6 +164,7 @@ export function EnrollmentPolicyPanel({ organizationId }: Props) {
     setOpen(false);
     setCreated(null);
     setError(null);
+    setConfirmingKeyId(null);
   };
 
   return (
@@ -445,12 +453,33 @@ export function EnrollmentPolicyPanel({ organizationId }: Props) {
                                     {revoked ? "Revoked" : expired ? "Expired" : "Active"}
                                   </span>
                                   {!revoked && (
-                                    <button
-                                      onClick={() => void revokeKey(key.id)}
-                                      style={{ background: "none", border: "none", color: "var(--status-error)", fontSize: 11, cursor: "pointer" }}
-                                    >
-                                      Revoke
-                                    </button>
+                                    confirmingKeyId === key.id ? (
+                                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                        <button
+                                          onClick={() => void revokeKey(key.id)}
+                                          disabled={revokingKeyId === key.id}
+                                          className="btn btn-danger btn-xs"
+                                          style={{ fontSize: 11, padding: "3px 8px" }}
+                                        >
+                                          {revokingKeyId === key.id ? "Revoking…" : "Confirm"}
+                                        </button>
+                                        <button
+                                          onClick={() => setConfirmingKeyId(null)}
+                                          disabled={revokingKeyId === key.id}
+                                          className="btn btn-ghost btn-xs"
+                                          style={{ fontSize: 11, padding: "3px 8px" }}
+                                        >
+                                          Cancel
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <button
+                                        onClick={() => setConfirmingKeyId(key.id)}
+                                        style={{ background: "none", border: "none", color: "var(--status-error)", fontSize: 11, cursor: "pointer" }}
+                                      >
+                                        Revoke
+                                      </button>
+                                    )
                                   )}
                                 </div>
                               </div>
