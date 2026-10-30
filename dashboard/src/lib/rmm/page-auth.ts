@@ -10,13 +10,7 @@ export async function adminPageContext(nextPath: string): Promise<AdminContext> 
   try {
     return await requireAdmin();
   } catch {
-    const devUserId = process.env.NEXT_PUBLIC_ADMIN_USER_ID || "fc09f0ab-04a7-4b2f-a323-3630736a176a";
-    const defaultOrgId = process.env.NEXT_PUBLIC_DEFAULT_ORG_ID || "00000000-0000-0000-0000-000000000001";
-    return {
-      userId: devUserId,
-      organizationId: defaultOrgId,
-      role: "owner",
-    };
+    redirect(`/auth/sign-in?returnUrl=${encodeURIComponent(nextPath)}`);
   }
 }
 

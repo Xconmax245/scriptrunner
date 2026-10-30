@@ -29,19 +29,24 @@ export async function getAuthenticatedUser() {
   const supabase = await createClient();
   try {
     const { data } = await supabase.auth.getUser();
-    if (data.user) return data.user;
+    if (data?.user) return data.user;
   } catch {
     // Ignore error
   }
-  const devUserId = process.env.NEXT_PUBLIC_ADMIN_USER_ID || "fc09f0ab-04a7-4b2f-a323-3630736a176a";
-  return {
-    id: devUserId,
-    email: "admin@scriptrunner.local",
-    app_metadata: {},
-    user_metadata: {},
-    aud: "authenticated",
-    created_at: new Date().toISOString(),
-  } as any;
+
+  if (process.env.ALLOW_DEV_AUTH_BYPASS === "true") {
+    const devUserId = process.env.NEXT_PUBLIC_ADMIN_USER_ID || "fc09f0ab-04a7-4b2f-a323-3630736a176a";
+    return {
+      id: devUserId,
+      email: "admin@scriptrunner.internal",
+      app_metadata: {},
+      user_metadata: {},
+      aud: "authenticated",
+      created_at: new Date().toISOString(),
+    } as any;
+  }
+
+  return null;
 }
 
 /**
@@ -54,8 +59,7 @@ export async function getAuthenticatedUser() {
 export async function requireUser() {
   const user = await getAuthenticatedUser();
   if (!user) {
-    const devUserId = process.env.NEXT_PUBLIC_ADMIN_USER_ID || "fc09f0ab-04a7-4b2f-a323-3630736a176a";
-    return { id: devUserId, email: "admin@scriptrunner.local" } as any;
+    throw new HttpError(401, "Authentication required. Please sign in.");
   }
   return user;
 }

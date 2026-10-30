@@ -47,8 +47,7 @@ export default async function DashboardLayout({
       .filter((o: any): o is { id: string; name: string; slug: string; role: any } => Boolean(o)) ?? [];
 
   if (!user) {
-    const devUserId = process.env.NEXT_PUBLIC_ADMIN_USER_ID || "fc09f0ab-04a7-4b2f-a323-3630736a176a";
-    user = { id: devUserId, email: "admin@scriptrunner.local" };
+    redirect("/auth/sign-in");
   }
 
   if (organizations.length === 0) {
@@ -63,7 +62,7 @@ export default async function DashboardLayout({
     ];
   }
 
-  const userEmail = user.email || "admin@scriptrunner.local";
+  const userEmail = user.email || "admin@scriptrunner.internal";
 
   return (
     <AOSProvider>

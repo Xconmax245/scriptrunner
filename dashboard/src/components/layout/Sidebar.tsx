@@ -86,7 +86,12 @@ export function Sidebar({ organizations, userEmail }: SidebarProps) {
   };
 
   const handleSignOut = async () => {
-    await supabase.auth.signOut();
+    try {
+      await supabase.auth.signOut();
+      await fetch("/api/auth/sign-out", { method: "POST" });
+    } catch {
+      // Ignore network errors on logout
+    }
     router.push("/auth/sign-in");
     router.refresh();
   };
