@@ -2,6 +2,7 @@
 
 import { useState, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import { z } from "zod";
 import { useForm } from "react-hook-form";
@@ -63,31 +64,40 @@ function SignInForm() {
   const onSubmit = async (values: SignInValues) => {
     setError(null);
     try {
-      const { data, error: authErr } = await supabase.auth.signInWithPassword({
-        email: values.email.trim(),
-        password: values.password,
+      // 1. Authenticate via rate-limited, zero-trust server endpoint
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: values.email.trim(),
+          password: values.password,
+        }),
       });
 
-      if (authErr) {
-        if (
-          authErr.message === "Invalid login credentials" ||
-          authErr.message.toLowerCase().includes("invalid")
-        ) {
-          setError("Invalid corporate credentials. Check email and password.");
-        } else {
-          setError(authErr.message);
-        }
+      const result = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        setError(
+          result?.error || "Invalid corporate credentials. Check email and master password."
+        );
         return;
       }
 
-      if (data.session) {
-        // Successful login
-        const destination = returnUrl.startsWith("/dashboard") ? returnUrl : "/dashboard";
-        router.push(destination);
-        router.refresh();
+      // Also ensure client-side Supabase session is synced
+      try {
+        await supabase.auth.signInWithPassword({
+          email: values.email.trim(),
+          password: values.password,
+        });
+      } catch {
+        // Handled via HttpOnly SSR cookie from /api/auth/login
       }
+
+      const destination = returnUrl.startsWith("/dashboard") ? returnUrl : "/dashboard";
+      router.push(destination);
+      router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Authentication failed");
+      setError(err instanceof Error ? err.message : "Authentication service unavailable");
     }
   };
 
@@ -448,8 +458,28 @@ function SignInForm() {
                     height: 14,
                   }}
                 />
-                Remember this workstation
+                Remember workstation
               </label>
+
+              <Link
+                href="/auth/forgot-password"
+                id="forgot-password-link"
+                style={{
+                  fontSize: 12,
+                  color: "#fbbf24",
+                  textDecoration: "none",
+                  fontWeight: 500,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  transition: "color 150ms",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.color = "#f59e0b")}
+                onMouseLeave={(e) => (e.currentTarget.style.color = "#fbbf24")}
+              >
+                <KeyRound style={{ width: 12, height: 12 }} />
+                Forgot Password?
+              </Link>
             </div>
 
             {/* Submit Button */}
