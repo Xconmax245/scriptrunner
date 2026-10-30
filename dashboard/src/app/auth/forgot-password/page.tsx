@@ -12,12 +12,11 @@ import {
   Loader2,
   Eye,
   EyeOff,
-  Send,
   ArrowLeft,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
-/* ─── Schemas ─── */
+/* ─── Schema ─── */
 
 const safeKeySchema = z
   .object({
@@ -33,42 +32,26 @@ const safeKeySchema = z
 
 type SafeKeyValues = z.infer<typeof safeKeySchema>;
 
-const emailResetSchema = z.object({
-  email: z.string().email("Enter a valid email address"),
-});
-
-type EmailResetValues = z.infer<typeof emailResetSchema>;
-
 /* ─── Component ─── */
 
 export default function ForgotPasswordPage() {
   const router = useRouter();
-  const [tab, setTab] = useState<"safekey" | "email">("safekey");
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [showSafeKey, setShowSafeKey] = useState(false);
 
   const {
-    register: registerSafe,
-    handleSubmit: handleSafeSubmit,
-    watch: watchSafe,
-    formState: { errors: safeErrors, isSubmitting: safeSubmitting },
+    register,
+    handleSubmit,
+    watch,
+    formState: { errors, isSubmitting },
   } = useForm<SafeKeyValues>({
     resolver: zodResolver(safeKeySchema),
     defaultValues: { email: "", safeKey: "", newPassword: "", confirmPassword: "" },
   });
 
-  const {
-    register: registerEmail,
-    handleSubmit: handleEmailSubmit,
-    formState: { errors: emailErrors, isSubmitting: emailSubmitting },
-  } = useForm<EmailResetValues>({
-    resolver: zodResolver(emailResetSchema),
-    defaultValues: { email: "" },
-  });
-
-  const newPasswordValue = watchSafe("newPassword") || "";
+  const newPasswordValue = watch("newPassword") || "";
 
   /* Password strength */
   const getStrength = (pass: string) => {
@@ -89,8 +72,7 @@ export default function ForgotPasswordPage() {
     Math.max(0, strength - 1)
   ] || "Weak";
 
-  /* Handlers */
-  const onSafeKeySubmit = async (values: SafeKeyValues) => {
+  const onSubmit = async (values: SafeKeyValues) => {
     setError(null);
     setSuccessMessage(null);
     try {
@@ -108,37 +90,11 @@ export default function ForgotPasswordPage() {
         setError(data.error || "Recovery failed. Please check your credentials.");
         return;
       }
-      setSuccessMessage("Password reset. Redirecting to dashboard…");
-      setTimeout(() => { router.push("/dashboard"); router.refresh(); }, 1500);
+      setSuccessMessage("Password reset. Signing you in…");
+      setTimeout(() => { router.push("/dashboard"); router.refresh(); }, 1200);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Request failed");
     }
-  };
-
-  const onEmailSubmit = async (values: EmailResetValues) => {
-    setError(null);
-    setSuccessMessage(null);
-    try {
-      const res = await fetch("/api/auth/forgot-password", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: values.email }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || "Unable to send reset link.");
-        return;
-      }
-      setSuccessMessage(data.message || "If that address is registered, a reset link has been sent.");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Request failed");
-    }
-  };
-
-  const switchTab = (next: "safekey" | "email") => {
-    setTab(next);
-    setError(null);
-    setSuccessMessage(null);
   };
 
   return (
@@ -149,7 +105,7 @@ export default function ForgotPasswordPage() {
         initial={{ opacity: 0, y: 18 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
-        style={{ width: "100%", maxWidth: 400, position: "relative", zIndex: 1 }}
+        style={{ width: "100%", maxWidth: 380, position: "relative", zIndex: 1 }}
       >
         {/* Back link */}
         <Link
@@ -166,26 +122,8 @@ export default function ForgotPasswordPage() {
         <div style={{ marginBottom: 32 }}>
           <h1 style={headingStyle}>Account recovery</h1>
           <p style={subheadingStyle}>
-            Reset your password using your safe key or a recovery link sent to your email.
+            Enter your safe key to reset your password and sign in.
           </p>
-        </div>
-
-        {/* Tab switcher */}
-        <div style={tabBarStyle}>
-          <button
-            type="button"
-            onClick={() => switchTab("safekey")}
-            style={tabButtonStyle(tab === "safekey")}
-          >
-            Safe Key
-          </button>
-          <button
-            type="button"
-            onClick={() => switchTab("email")}
-            style={tabButtonStyle(tab === "email")}
-          >
-            Email Link
-          </button>
         </div>
 
         {/* Banners */}
@@ -216,192 +154,131 @@ export default function ForgotPasswordPage() {
           )}
         </AnimatePresence>
 
-        {/* ── Safe Key tab ── */}
-        <AnimatePresence mode="wait">
-          {tab === "safekey" && (
-            <motion.form
-              key="safekey-form"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              onSubmit={handleSafeSubmit(onSafeKeySubmit)}
-              noValidate
-              style={{ display: "flex", flexDirection: "column", gap: 18 }}
-            >
-              {/* Email */}
-              <div>
-                <label htmlFor="safe-email" style={labelStyle}>Email</label>
-                <input
-                  id="safe-email"
-                  type="email"
-                  autoComplete="email"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                  placeholder="you@example.com"
-                  {...registerSafe("email")}
-                  aria-invalid={!!safeErrors.email}
-                  style={inputStyle(!!safeErrors.email)}
-                />
-                {safeErrors.email && <p style={fieldErrorStyle}>{safeErrors.email.message}</p>}
-              </div>
+        <form
+          onSubmit={handleSubmit(onSubmit)}
+          noValidate
+          style={{ display: "flex", flexDirection: "column", gap: 18 }}
+        >
+          {/* Email */}
+          <div>
+            <label htmlFor="safe-email" style={labelStyle}>Email</label>
+            <input
+              id="safe-email"
+              type="email"
+              autoComplete="email"
+              autoCapitalize="none"
+              spellCheck={false}
+              placeholder="you@example.com"
+              {...register("email")}
+              aria-invalid={!!errors.email}
+              style={inputStyle(!!errors.email)}
+            />
+            {errors.email && <p style={fieldErrorStyle}>{errors.email.message}</p>}
+          </div>
 
-              {/* Safe Key */}
-              <div>
-                <label htmlFor="safe-key" style={labelStyle}>Safe Key</label>
-                <div style={{ position: "relative" }}>
-                  <input
-                    id="safe-key"
-                    type={showSafeKey ? "text" : "password"}
-                    autoComplete="off"
-                    placeholder="Enter your safe key"
-                    {...registerSafe("safeKey")}
-                    aria-invalid={!!safeErrors.safeKey}
-                    style={{ ...inputStyle(!!safeErrors.safeKey), paddingRight: 42 }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowSafeKey(!showSafeKey)}
-                    aria-label={showSafeKey ? "Hide safe key" : "Show safe key"}
-                    style={eyeButtonStyle}
-                  >
-                    {showSafeKey ? <EyeOff style={{ width: 15, height: 15 }} /> : <Eye style={{ width: 15, height: 15 }} />}
-                  </button>
-                </div>
-                {safeErrors.safeKey && <p style={fieldErrorStyle}>{safeErrors.safeKey.message}</p>}
-              </div>
-
-              {/* New Password */}
-              <div>
-                <label htmlFor="new-password" style={labelStyle}>New Password</label>
-                <div style={{ position: "relative" }}>
-                  <input
-                    id="new-password"
-                    type={showPassword ? "text" : "password"}
-                    autoComplete="new-password"
-                    placeholder="••••••••"
-                    {...registerSafe("newPassword")}
-                    aria-invalid={!!safeErrors.newPassword}
-                    style={{ ...inputStyle(!!safeErrors.newPassword), paddingRight: 42 }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    aria-label={showPassword ? "Hide password" : "Show password"}
-                    style={eyeButtonStyle}
-                  >
-                    {showPassword ? <EyeOff style={{ width: 15, height: 15 }} /> : <Eye style={{ width: 15, height: 15 }} />}
-                  </button>
-                </div>
-
-                {/* Strength bar */}
-                {newPasswordValue.length > 0 && (
-                  <div style={{ marginTop: 8 }}>
-                    <div style={{ height: 2, borderRadius: 2, background: "rgba(255,255,255,0.08)", overflow: "hidden" }}>
-                      <div
-                        style={{
-                          height: "100%",
-                          width: `${Math.min(100, (strength / 5) * 100)}%`,
-                          background: strengthColor,
-                          transition: "width 200ms, background 200ms",
-                          borderRadius: 2,
-                        }}
-                      />
-                    </div>
-                    <p style={{ fontSize: 11, color: strengthColor, marginTop: 4, textAlign: "right" }}>
-                      {strengthLabel}
-                    </p>
-                  </div>
-                )}
-                {safeErrors.newPassword && <p style={fieldErrorStyle}>{safeErrors.newPassword.message}</p>}
-              </div>
-
-              {/* Confirm Password */}
-              <div>
-                <label htmlFor="confirm-password" style={labelStyle}>Confirm Password</label>
-                <input
-                  id="confirm-password"
-                  type={showPassword ? "text" : "password"}
-                  autoComplete="new-password"
-                  placeholder="••••••••"
-                  {...registerSafe("confirmPassword")}
-                  aria-invalid={!!safeErrors.confirmPassword}
-                  style={inputStyle(!!safeErrors.confirmPassword)}
-                />
-                {safeErrors.confirmPassword && <p style={fieldErrorStyle}>{safeErrors.confirmPassword.message}</p>}
-              </div>
-
+          {/* Safe Key */}
+          <div>
+            <label htmlFor="safe-key" style={labelStyle}>Safe Key</label>
+            <div style={{ position: "relative" }}>
+              <input
+                id="safe-key"
+                type={showSafeKey ? "text" : "password"}
+                autoComplete="off"
+                placeholder="Enter your safe key"
+                {...register("safeKey")}
+                aria-invalid={!!errors.safeKey}
+                style={{ ...inputStyle(!!errors.safeKey), paddingRight: 42 }}
+              />
               <button
-                type="submit"
-                id="reset-safekey-submit-btn"
-                disabled={safeSubmitting}
-                style={submitButtonStyle(safeSubmitting)}
+                type="button"
+                onClick={() => setShowSafeKey(!showSafeKey)}
+                aria-label={showSafeKey ? "Hide safe key" : "Show safe key"}
+                style={eyeButtonStyle}
               >
-                {safeSubmitting ? (
-                  <>
-                    <Loader2 style={{ width: 15, height: 15 }} className="animate-spin" />
-                    Verifying…
-                  </>
-                ) : (
-                  "Reset Password"
-                )}
+                {showSafeKey
+                  ? <EyeOff style={{ width: 15, height: 15 }} />
+                  : <Eye style={{ width: 15, height: 15 }} />}
               </button>
-            </motion.form>
-          )}
+            </div>
+            {errors.safeKey && <p style={fieldErrorStyle}>{errors.safeKey.message}</p>}
+          </div>
 
-          {/* ── Email tab ── */}
-          {tab === "email" && (
-            <motion.form
-              key="email-form"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.15 }}
-              onSubmit={handleEmailSubmit(onEmailSubmit)}
-              noValidate
-              style={{ display: "flex", flexDirection: "column", gap: 18 }}
-            >
-              <p style={{ fontSize: 13, color: "rgba(255,255,255,0.42)", lineHeight: 1.55 }}>
-                We&apos;ll send a single-use reset link to your registered email. Check your inbox after submitting.
-              </p>
-
-              <div>
-                <label htmlFor="email-reset" style={labelStyle}>Email</label>
-                <input
-                  id="email-reset"
-                  type="email"
-                  autoComplete="email"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                  placeholder="you@example.com"
-                  {...registerEmail("email")}
-                  aria-invalid={!!emailErrors.email}
-                  style={inputStyle(!!emailErrors.email)}
-                />
-                {emailErrors.email && <p style={fieldErrorStyle}>{emailErrors.email.message}</p>}
-              </div>
-
+          {/* New Password */}
+          <div>
+            <label htmlFor="new-password" style={labelStyle}>New Password</label>
+            <div style={{ position: "relative" }}>
+              <input
+                id="new-password"
+                type={showPassword ? "text" : "password"}
+                autoComplete="new-password"
+                placeholder="••••••••"
+                {...register("newPassword")}
+                aria-invalid={!!errors.newPassword}
+                style={{ ...inputStyle(!!errors.newPassword), paddingRight: 42 }}
+              />
               <button
-                type="submit"
-                id="send-email-reset-btn"
-                disabled={emailSubmitting}
-                style={submitButtonStyle(emailSubmitting)}
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                aria-label={showPassword ? "Hide password" : "Show password"}
+                style={eyeButtonStyle}
               >
-                {emailSubmitting ? (
-                  <>
-                    <Loader2 style={{ width: 15, height: 15 }} className="animate-spin" />
-                    Sending…
-                  </>
-                ) : (
-                  <>
-                    <Send style={{ width: 14, height: 14 }} />
-                    Send Reset Link
-                  </>
-                )}
+                {showPassword
+                  ? <EyeOff style={{ width: 15, height: 15 }} />
+                  : <Eye style={{ width: 15, height: 15 }} />}
               </button>
-            </motion.form>
-          )}
-        </AnimatePresence>
+            </div>
+            {newPasswordValue.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ height: 2, borderRadius: 2, background: "rgba(255,255,255,0.08)", overflow: "hidden" }}>
+                  <div
+                    style={{
+                      height: "100%",
+                      width: `${Math.min(100, (strength / 5) * 100)}%`,
+                      background: strengthColor,
+                      transition: "width 200ms, background 200ms",
+                      borderRadius: 2,
+                    }}
+                  />
+                </div>
+                <p style={{ fontSize: 11, color: strengthColor, marginTop: 4, textAlign: "right" }}>
+                  {strengthLabel}
+                </p>
+              </div>
+            )}
+            {errors.newPassword && <p style={fieldErrorStyle}>{errors.newPassword.message}</p>}
+          </div>
+
+          {/* Confirm Password */}
+          <div>
+            <label htmlFor="confirm-password" style={labelStyle}>Confirm Password</label>
+            <input
+              id="confirm-password"
+              type={showPassword ? "text" : "password"}
+              autoComplete="new-password"
+              placeholder="••••••••"
+              {...register("confirmPassword")}
+              aria-invalid={!!errors.confirmPassword}
+              style={inputStyle(!!errors.confirmPassword)}
+            />
+            {errors.confirmPassword && <p style={fieldErrorStyle}>{errors.confirmPassword.message}</p>}
+          </div>
+
+          <button
+            type="submit"
+            id="reset-safekey-submit-btn"
+            disabled={isSubmitting}
+            style={submitButtonStyle(isSubmitting)}
+          >
+            {isSubmitting ? (
+              <>
+                <Loader2 style={{ width: 15, height: 15 }} className="animate-spin" />
+                Verifying…
+              </>
+            ) : (
+              "Reset & Sign In"
+            )}
+          </button>
+        </form>
       </motion.div>
     </div>
   );
@@ -455,30 +332,6 @@ const subheadingStyle: React.CSSProperties = {
   color: "rgba(255,255,255,0.42)",
   lineHeight: 1.55,
 };
-
-const tabBarStyle: React.CSSProperties = {
-  display: "flex",
-  gap: 2,
-  background: "rgba(255,255,255,0.04)",
-  borderRadius: 9,
-  padding: 3,
-  marginBottom: 24,
-};
-
-const tabButtonStyle = (active: boolean): React.CSSProperties => ({
-  flex: 1,
-  padding: "7px 12px",
-  borderRadius: 6,
-  fontSize: 13,
-  fontWeight: 500,
-  border: "none",
-  cursor: "pointer",
-  background: active ? "rgba(255,255,255,0.1)" : "transparent",
-  color: active ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.35)",
-  transition: "all 150ms",
-  fontFamily: "inherit",
-  letterSpacing: "-0.01em",
-});
 
 const labelStyle: React.CSSProperties = {
   display: "block",
