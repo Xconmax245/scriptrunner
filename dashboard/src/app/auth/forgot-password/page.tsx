@@ -7,25 +7,22 @@ import { z } from "zod";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import {
-  Shield,
-  KeyRound,
-  Lock,
-  Mail,
   AlertCircle,
   CheckCircle2,
   Loader2,
-  ArrowLeft,
   Eye,
   EyeOff,
-  Sparkles,
   Send,
+  ArrowLeft,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
+/* ─── Schemas ─── */
+
 const safeKeySchema = z
   .object({
-    email: z.string().email("Enter a valid corporate email address"),
-    safeKey: z.string().min(1, "Emergency Safe Key is required"),
+    email: z.string().email("Enter a valid email address"),
+    safeKey: z.string().min(1, "Safe key is required"),
     newPassword: z.string().min(8, "Password must be at least 8 characters"),
     confirmPassword: z.string().min(8, "Please confirm the password"),
   })
@@ -37,10 +34,12 @@ const safeKeySchema = z
 type SafeKeyValues = z.infer<typeof safeKeySchema>;
 
 const emailResetSchema = z.object({
-  email: z.string().email("Enter a valid corporate email address"),
+  email: z.string().email("Enter a valid email address"),
 });
 
 type EmailResetValues = z.infer<typeof emailResetSchema>;
+
+/* ─── Component ─── */
 
 export default function ForgotPasswordPage() {
   const router = useRouter();
@@ -49,64 +48,51 @@ export default function ForgotPasswordPage() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [showSafeKey, setShowSafeKey] = useState(false);
-  const [filledSafeKey, setFilledSafeKey] = useState(false);
 
-  // Safe Key Form
   const {
     register: registerSafe,
     handleSubmit: handleSafeSubmit,
-    setValue: setSafeValue,
     watch: watchSafe,
     formState: { errors: safeErrors, isSubmitting: safeSubmitting },
   } = useForm<SafeKeyValues>({
     resolver: zodResolver(safeKeySchema),
-    defaultValues: {
-      email: "admin@scriptrunner.internal",
-      safeKey: "",
-      newPassword: "",
-      confirmPassword: "",
-    },
+    defaultValues: { email: "", safeKey: "", newPassword: "", confirmPassword: "" },
   });
 
-  // Email Reset Form
   const {
     register: registerEmail,
     handleSubmit: handleEmailSubmit,
     formState: { errors: emailErrors, isSubmitting: emailSubmitting },
   } = useForm<EmailResetValues>({
     resolver: zodResolver(emailResetSchema),
-    defaultValues: {
-      email: "admin@scriptrunner.internal",
-    },
+    defaultValues: { email: "" },
   });
 
   const newPasswordValue = watchSafe("newPassword") || "";
 
-  // Password strength calculation
-  const getPasswordStrength = (pass: string) => {
-    let score = 0;
-    if (pass.length >= 8) score++;
-    if (pass.length >= 12) score++;
-    if (/[A-Z]/.test(pass) && /[a-z]/.test(pass)) score++;
-    if (/[0-9]/.test(pass)) score++;
-    if (/[^A-Za-z0-9]/.test(pass)) score++;
-    return score;
+  /* Password strength */
+  const getStrength = (pass: string) => {
+    let s = 0;
+    if (pass.length >= 8) s++;
+    if (pass.length >= 12) s++;
+    if (/[A-Z]/.test(pass) && /[a-z]/.test(pass)) s++;
+    if (/[0-9]/.test(pass)) s++;
+    if (/[^A-Za-z0-9]/.test(pass)) s++;
+    return s;
   };
 
-  const strengthScore = getPasswordStrength(newPasswordValue);
-  const strengthLabels = ["Weak", "Fair", "Good", "Strong", "Military-Grade"];
-  const strengthColors = ["#ef4444", "#f97316", "#eab308", "#10b981", "#3b82f6"];
+  const strength = getStrength(newPasswordValue);
+  const strengthColor = ["#ef4444", "#f97316", "#eab308", "#10b981", "#3b82f6"][
+    Math.max(0, strength - 1)
+  ] || "#ef4444";
+  const strengthLabel = ["Weak", "Fair", "Good", "Strong", "Excellent"][
+    Math.max(0, strength - 1)
+  ] || "Weak";
 
-  const handleQuickSafeKey = () => {
-    setSafeValue("safeKey", "FEAR GOD", { shouldValidate: true });
-    setFilledSafeKey(true);
-    setTimeout(() => setFilledSafeKey(false), 2500);
-  };
-
+  /* Handlers */
   const onSafeKeySubmit = async (values: SafeKeyValues) => {
     setError(null);
     setSuccessMessage(null);
-
     try {
       const res = await fetch("/api/auth/reset-with-safekey", {
         method: "POST",
@@ -117,588 +103,472 @@ export default function ForgotPasswordPage() {
           newPassword: values.newPassword,
         }),
       });
-
       const data = await res.json();
       if (!res.ok) {
-        setError(data.error || "Recovery failed. Please verify credentials.");
+        setError(data.error || "Recovery failed. Please check your credentials.");
         return;
       }
-
-      setSuccessMessage(
-        "Emergency Safe Key accepted! Master password has been securely reset. Entering dashboard…"
-      );
-
-      setTimeout(() => {
-        router.push("/dashboard");
-        router.refresh();
-      }, 1500);
+      setSuccessMessage("Password reset. Redirecting to dashboard…");
+      setTimeout(() => { router.push("/dashboard"); router.refresh(); }, 1500);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Recovery request failed");
+      setError(err instanceof Error ? err.message : "Request failed");
     }
   };
 
   const onEmailSubmit = async (values: EmailResetValues) => {
     setError(null);
     setSuccessMessage(null);
-
     try {
       const res = await fetch("/api/auth/forgot-password", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: values.email }),
       });
-
       const data = await res.json();
       if (!res.ok) {
-        setError(data.error || "Unable to dispatch reset link");
+        setError(data.error || "Unable to send reset link.");
         return;
       }
-
-      setSuccessMessage(data.message || "Reset link dispatched if corporate account exists.");
+      setSuccessMessage(data.message || "If that address is registered, a reset link has been sent.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Request failed");
     }
   };
 
+  const switchTab = (next: "safekey" | "email") => {
+    setTab(next);
+    setError(null);
+    setSuccessMessage(null);
+  };
+
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "24px 16px",
-        background:
-          "radial-gradient(ellipse 80% 60% at 50% -10%, rgba(234, 179, 8, 0.12), transparent 70%), var(--bg-base)",
-        position: "relative",
-        overflow: "hidden",
-      }}
-    >
-      {/* Background grid */}
-      <div
-        style={{
-          position: "absolute",
-          inset: 0,
-          backgroundImage:
-            "linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px), linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px)",
-          backgroundSize: "40px 40px",
-          pointerEvents: "none",
-        }}
-      />
+    <div style={pageStyle}>
+      <div style={noiseStyle} />
 
       <motion.div
-        initial={{ opacity: 0, y: 16, scale: 0.98 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
-        style={{ width: "100%", maxWidth: 460, position: "relative", zIndex: 1 }}
+        initial={{ opacity: 0, y: 18 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+        style={{ width: "100%", maxWidth: 400, position: "relative", zIndex: 1 }}
       >
-        {/* Back Link */}
+        {/* Back link */}
         <Link
           href="/auth/sign-in"
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 6,
-            fontSize: 12,
-            color: "var(--text-tertiary)",
-            textDecoration: "none",
-            marginBottom: 20,
-            transition: "color 150ms",
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--text-primary)")}
-          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--text-tertiary)")}
+          style={backLinkStyle}
+          onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(255,255,255,0.65)")}
+          onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(255,255,255,0.3)")}
         >
-          <ArrowLeft style={{ width: 14, height: 14 }} />
-          Back to Authentication
+          <ArrowLeft style={{ width: 13, height: 13 }} />
+          Back to sign in
         </Link>
 
-        {/* Brand Header */}
-        <div style={{ textAlign: "center", marginBottom: 24 }}>
-          <div
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: 50,
-              height: 50,
-              borderRadius: 16,
-              background: "linear-gradient(135deg, #fbbf24 0%, #d97706 100%)",
-              boxShadow: "0 12px 32px rgba(245, 158, 11, 0.25), 0 0 0 1px rgba(251, 191, 36, 0.4)",
-              marginBottom: 14,
-            }}
-          >
-            <KeyRound style={{ width: 24, height: 24, color: "#000000" }} />
-          </div>
-
-          <h1
-            style={{
-              fontSize: 22,
-              fontWeight: 700,
-              color: "var(--text-primary)",
-              letterSpacing: "-0.02em",
-            }}
-          >
-            Account Recovery
-          </h1>
-          <p style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 4 }}>
-            Zero-Trust Credential Reset &amp; Safe Key Authorization
+        {/* Header */}
+        <div style={{ marginBottom: 32 }}>
+          <h1 style={headingStyle}>Account recovery</h1>
+          <p style={subheadingStyle}>
+            Reset your password using your safe key or a recovery link sent to your email.
           </p>
         </div>
 
-        {/* Recovery Card */}
-        <div
-          className="card"
-          style={{
-            padding: "26px 28px",
-            background: "rgba(18, 20, 26, 0.85)",
-            backdropFilter: "blur(24px)",
-            WebkitBackdropFilter: "blur(24px)",
-            border: "1px solid rgba(255, 255, 255, 0.08)",
-            boxShadow: "0 24px 60px rgba(0, 0, 0, 0.45)",
-            borderRadius: 16,
-          }}
-        >
-          {/* Recovery Method Tabs */}
-          <div
-            style={{
-              display: "flex",
-              gap: 4,
-              padding: 3,
-              background: "var(--bg-overlay)",
-              borderRadius: 10,
-              border: "1px solid var(--border-subtle)",
-              marginBottom: 20,
-            }}
+        {/* Tab switcher */}
+        <div style={tabBarStyle}>
+          <button
+            type="button"
+            onClick={() => switchTab("safekey")}
+            style={tabButtonStyle(tab === "safekey")}
           >
-            <button
-              type="button"
-              onClick={() => {
-                setTab("safekey");
-                setError(null);
-                setSuccessMessage(null);
-              }}
-              style={{
-                flex: 1,
-                padding: "8px 12px",
-                borderRadius: 7,
-                fontSize: 12,
-                fontWeight: 600,
-                border: "none",
-                cursor: "pointer",
-                background: tab === "safekey" ? "rgba(251, 191, 36, 0.15)" : "transparent",
-                color: tab === "safekey" ? "#fbbf24" : "var(--text-tertiary)",
-                transition: "all 150ms",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 6,
-              }}
+            Safe Key
+          </button>
+          <button
+            type="button"
+            onClick={() => switchTab("email")}
+            style={tabButtonStyle(tab === "email")}
+          >
+            Email Link
+          </button>
+        </div>
+
+        {/* Banners */}
+        <AnimatePresence>
+          {error && (
+            <motion.div
+              key="err"
+              initial={{ opacity: 0, height: 0, marginBottom: 0 }}
+              animate={{ opacity: 1, height: "auto", marginBottom: 20 }}
+              exit={{ opacity: 0, height: 0, marginBottom: 0 }}
+              style={errorBannerStyle}
             >
-              <KeyRound style={{ width: 13, height: 13 }} />
-              Safe Key Override
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setTab("email");
-                setError(null);
-                setSuccessMessage(null);
-              }}
-              style={{
-                flex: 1,
-                padding: "8px 12px",
-                borderRadius: 7,
-                fontSize: 12,
-                fontWeight: 600,
-                border: "none",
-                cursor: "pointer",
-                background: tab === "email" ? "rgba(255, 255, 255, 0.1)" : "transparent",
-                color: tab === "email" ? "var(--text-primary)" : "var(--text-tertiary)",
-                transition: "all 150ms",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 6,
-              }}
+              <AlertCircle style={{ width: 14, height: 14, flexShrink: 0, marginTop: 1 }} />
+              <span>{error}</span>
+            </motion.div>
+          )}
+          {successMessage && (
+            <motion.div
+              key="ok"
+              initial={{ opacity: 0, height: 0, marginBottom: 0 }}
+              animate={{ opacity: 1, height: "auto", marginBottom: 20 }}
+              exit={{ opacity: 0, height: 0, marginBottom: 0 }}
+              style={successBannerStyle}
             >
-              <Mail style={{ width: 13, height: 13 }} />
-              Email Link
-            </button>
-          </div>
+              <CheckCircle2 style={{ width: 14, height: 14, flexShrink: 0, marginTop: 1 }} />
+              <span>{successMessage}</span>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
-          {/* Feedback Banners */}
-          <AnimatePresence>
-            {error && (
-              <motion.div
-                initial={{ opacity: 0, y: -6, height: 0 }}
-                animate={{ opacity: 1, y: 0, height: "auto" }}
-                exit={{ opacity: 0, y: -6, height: 0 }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  padding: "10px 14px",
-                  borderRadius: "var(--radius-sm)",
-                  border: "1px solid rgba(248, 113, 113, 0.25)",
-                  background: "rgba(248, 113, 113, 0.08)",
-                  color: "var(--status-error)",
-                  fontSize: 12,
-                  marginBottom: 16,
-                }}
-              >
-                <AlertCircle style={{ width: 15, height: 15, flexShrink: 0 }} />
-                <span>{error}</span>
-              </motion.div>
-            )}
-
-            {successMessage && (
-              <motion.div
-                initial={{ opacity: 0, y: -6, height: 0 }}
-                animate={{ opacity: 1, y: 0, height: "auto" }}
-                exit={{ opacity: 0, y: -6, height: 0 }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  padding: "10px 14px",
-                  borderRadius: "var(--radius-sm)",
-                  border: "1px solid rgba(52, 211, 153, 0.25)",
-                  background: "rgba(52, 211, 153, 0.08)",
-                  color: "var(--status-online)",
-                  fontSize: 12,
-                  marginBottom: 16,
-                }}
-              >
-                <CheckCircle2 style={{ width: 15, height: 15, flexShrink: 0 }} />
-                <span>{successMessage}</span>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* TAB 1: Safe Key Recovery */}
+        {/* ── Safe Key tab ── */}
+        <AnimatePresence mode="wait">
           {tab === "safekey" && (
-            <form
+            <motion.form
+              key="safekey-form"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
               onSubmit={handleSafeSubmit(onSafeKeySubmit)}
-              style={{ display: "flex", flexDirection: "column", gap: 14 }}
               noValidate
+              style={{ display: "flex", flexDirection: "column", gap: 18 }}
             >
-              {/* Quick Fill Helper */}
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  padding: "9px 12px",
-                  borderRadius: "var(--radius-sm)",
-                  background: "rgba(251, 191, 36, 0.05)",
-                  border: "1px dashed rgba(251, 191, 36, 0.2)",
-                  fontSize: 11,
-                }}
-              >
-                <div style={{ minWidth: 0 }}>
-                  <span style={{ fontWeight: 600, color: "#fbbf24" }}>
-                    Safe Key Verification
-                  </span>
-                  <p style={{ color: "var(--text-tertiary)", marginTop: 1 }}>
-                    Uses Argon2id cryptographic validation
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  id="fill-safekey-btn"
-                  onClick={handleQuickSafeKey}
-                  className="btn btn-secondary btn-xs"
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 5,
-                    fontSize: 11,
-                    padding: "3px 8px",
-                  }}
-                >
-                  {filledSafeKey ? (
-                    <>
-                      <CheckCircle2 style={{ width: 11, height: 11, color: "var(--status-online)" }} />
-                      <span style={{ color: "var(--status-online)" }}>Inserted</span>
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles style={{ width: 11, height: 11 }} />
-                      <span>Insert Safe Key</span>
-                    </>
-                  )}
-                </button>
-              </div>
-
-              {/* Corporate Email */}
+              {/* Email */}
               <div>
-                <label htmlFor="safe-email" className="label" style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <Mail style={{ width: 12, height: 12, color: "var(--text-tertiary)" }} />
-                  Corporate Email
-                </label>
+                <label htmlFor="safe-email" style={labelStyle}>Email</label>
                 <input
                   id="safe-email"
                   type="email"
-                  className="input"
-                  placeholder="admin@scriptrunner.internal"
+                  autoComplete="email"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  placeholder="you@example.com"
                   {...registerSafe("email")}
                   aria-invalid={!!safeErrors.email}
-                  style={{ height: 38 }}
+                  style={inputStyle(!!safeErrors.email)}
                 />
-                {safeErrors.email && (
-                  <p style={{ color: "var(--status-error)", fontSize: 11, marginTop: 4 }}>
-                    {safeErrors.email.message}
-                  </p>
-                )}
+                {safeErrors.email && <p style={fieldErrorStyle}>{safeErrors.email.message}</p>}
               </div>
 
-              {/* Emergency Safe Key Field */}
+              {/* Safe Key */}
               <div>
-                <label htmlFor="safe-key" className="label" style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <KeyRound style={{ width: 12, height: 12, color: "#fbbf24" }} />
-                  Emergency Safe Key
-                </label>
+                <label htmlFor="safe-key" style={labelStyle}>Safe Key</label>
                 <div style={{ position: "relative" }}>
                   <input
                     id="safe-key"
                     type={showSafeKey ? "text" : "password"}
-                    className="input"
-                    placeholder="FEAR GOD"
+                    autoComplete="off"
+                    placeholder="Enter your safe key"
                     {...registerSafe("safeKey")}
                     aria-invalid={!!safeErrors.safeKey}
-                    style={{ height: 38, paddingRight: 38 }}
+                    style={{ ...inputStyle(!!safeErrors.safeKey), paddingRight: 42 }}
                   />
                   <button
                     type="button"
                     onClick={() => setShowSafeKey(!showSafeKey)}
-                    aria-label={showSafeKey ? "Hide Safe Key" : "Show Safe Key"}
-                    style={{
-                      position: "absolute",
-                      right: 10,
-                      top: "50%",
-                      transform: "translateY(-50%)",
-                      background: "none",
-                      border: "none",
-                      color: "var(--text-tertiary)",
-                      cursor: "pointer",
-                      padding: 4,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                    }}
+                    aria-label={showSafeKey ? "Hide safe key" : "Show safe key"}
+                    style={eyeButtonStyle}
                   >
-                    {showSafeKey ? <EyeOff style={{ width: 14, height: 14 }} /> : <Eye style={{ width: 14, height: 14 }} />}
+                    {showSafeKey ? <EyeOff style={{ width: 15, height: 15 }} /> : <Eye style={{ width: 15, height: 15 }} />}
                   </button>
                 </div>
-                {safeErrors.safeKey && (
-                  <p style={{ color: "var(--status-error)", fontSize: 11, marginTop: 4 }}>
-                    {safeErrors.safeKey.message}
-                  </p>
-                )}
+                {safeErrors.safeKey && <p style={fieldErrorStyle}>{safeErrors.safeKey.message}</p>}
               </div>
 
               {/* New Password */}
               <div>
-                <label htmlFor="new-password" className="label" style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <Lock style={{ width: 12, height: 12, color: "var(--text-tertiary)" }} />
-                  New Master Password
-                </label>
+                <label htmlFor="new-password" style={labelStyle}>New Password</label>
                 <div style={{ position: "relative" }}>
                   <input
                     id="new-password"
                     type={showPassword ? "text" : "password"}
                     autoComplete="new-password"
-                    className="input"
-                    placeholder="••••••••••••"
+                    placeholder="••••••••"
                     {...registerSafe("newPassword")}
                     aria-invalid={!!safeErrors.newPassword}
-                    style={{ height: 38, paddingRight: 38 }}
+                    style={{ ...inputStyle(!!safeErrors.newPassword), paddingRight: 42 }}
                   />
                   <button
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
                     aria-label={showPassword ? "Hide password" : "Show password"}
-                    style={{
-                      position: "absolute",
-                      right: 10,
-                      top: "50%",
-                      transform: "translateY(-50%)",
-                      background: "none",
-                      border: "none",
-                      color: "var(--text-tertiary)",
-                      cursor: "pointer",
-                      padding: 4,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                    }}
+                    style={eyeButtonStyle}
                   >
-                    {showPassword ? <EyeOff style={{ width: 14, height: 14 }} /> : <Eye style={{ width: 14, height: 14 }} />}
+                    {showPassword ? <EyeOff style={{ width: 15, height: 15 }} /> : <Eye style={{ width: 15, height: 15 }} />}
                   </button>
                 </div>
 
-                {/* Password strength bar */}
+                {/* Strength bar */}
                 {newPasswordValue.length > 0 && (
-                  <div style={{ marginTop: 6 }}>
-                    <div
-                      style={{
-                        height: 3,
-                        borderRadius: 2,
-                        background: "rgba(255,255,255,0.1)",
-                        overflow: "hidden",
-                        display: "flex",
-                      }}
-                    >
+                  <div style={{ marginTop: 8 }}>
+                    <div style={{ height: 2, borderRadius: 2, background: "rgba(255,255,255,0.08)", overflow: "hidden" }}>
                       <div
                         style={{
-                          width: `${Math.min(100, (strengthScore / 5) * 100)}%`,
-                          background: strengthColors[Math.max(0, strengthScore - 1)] || "#ef4444",
+                          height: "100%",
+                          width: `${Math.min(100, (strength / 5) * 100)}%`,
+                          background: strengthColor,
                           transition: "width 200ms, background 200ms",
+                          borderRadius: 2,
                         }}
                       />
                     </div>
-                    <p
-                      style={{
-                        fontSize: 10,
-                        color: strengthColors[Math.max(0, strengthScore - 1)] || "#ef4444",
-                        marginTop: 4,
-                        textAlign: "right",
-                      }}
-                    >
-                      Strength: {strengthLabels[Math.max(0, strengthScore - 1)]}
+                    <p style={{ fontSize: 11, color: strengthColor, marginTop: 4, textAlign: "right" }}>
+                      {strengthLabel}
                     </p>
                   </div>
                 )}
-
-                {safeErrors.newPassword && (
-                  <p style={{ color: "var(--status-error)", fontSize: 11, marginTop: 4 }}>
-                    {safeErrors.newPassword.message}
-                  </p>
-                )}
+                {safeErrors.newPassword && <p style={fieldErrorStyle}>{safeErrors.newPassword.message}</p>}
               </div>
 
               {/* Confirm Password */}
               <div>
-                <label htmlFor="confirm-password" className="label" style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <Shield style={{ width: 12, height: 12, color: "var(--text-tertiary)" }} />
-                  Confirm Password
-                </label>
+                <label htmlFor="confirm-password" style={labelStyle}>Confirm Password</label>
                 <input
                   id="confirm-password"
                   type={showPassword ? "text" : "password"}
                   autoComplete="new-password"
-                  className="input"
-                  placeholder="••••••••••••"
+                  placeholder="••••••••"
                   {...registerSafe("confirmPassword")}
                   aria-invalid={!!safeErrors.confirmPassword}
-                  style={{ height: 38 }}
+                  style={inputStyle(!!safeErrors.confirmPassword)}
                 />
-                {safeErrors.confirmPassword && (
-                  <p style={{ color: "var(--status-error)", fontSize: 11, marginTop: 4 }}>
-                    {safeErrors.confirmPassword.message}
-                  </p>
-                )}
+                {safeErrors.confirmPassword && <p style={fieldErrorStyle}>{safeErrors.confirmPassword.message}</p>}
               </div>
 
-              {/* Submit Button */}
               <button
                 type="submit"
                 id="reset-safekey-submit-btn"
-                className="btn btn-primary"
                 disabled={safeSubmitting}
-                style={{
-                  width: "100%",
-                  height: 40,
-                  marginTop: 6,
-                  fontWeight: 600,
-                  background: "linear-gradient(135deg, #fbbf24 0%, #d97706 100%)",
-                  color: "#000000",
-                  border: "none",
-                }}
+                style={submitButtonStyle(safeSubmitting)}
               >
                 {safeSubmitting ? (
                   <>
-                    <Loader2 style={{ width: 14, height: 14 }} className="animate-spin" />
-                    Validating Safe Key…
+                    <Loader2 style={{ width: 15, height: 15 }} className="animate-spin" />
+                    Verifying…
                   </>
                 ) : (
-                  "Reset Password & Enter Dashboard"
+                  "Reset Password"
                 )}
               </button>
-            </form>
+            </motion.form>
           )}
 
-          {/* TAB 2: Email Reset Link */}
+          {/* ── Email tab ── */}
           {tab === "email" && (
-            <form
+            <motion.form
+              key="email-form"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
               onSubmit={handleEmailSubmit(onEmailSubmit)}
-              style={{ display: "flex", flexDirection: "column", gap: 16 }}
               noValidate
+              style={{ display: "flex", flexDirection: "column", gap: 18 }}
             >
-              <p style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.5 }}>
-                Enter your registered corporate email to receive a secure, single-use password reset link.
+              <p style={{ fontSize: 13, color: "rgba(255,255,255,0.42)", lineHeight: 1.55 }}>
+                We&apos;ll send a single-use reset link to your registered email. Check your inbox after submitting.
               </p>
 
               <div>
-                <label htmlFor="email-reset" className="label" style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <Mail style={{ width: 12, height: 12, color: "var(--text-tertiary)" }} />
-                  Corporate Email
-                </label>
+                <label htmlFor="email-reset" style={labelStyle}>Email</label>
                 <input
                   id="email-reset"
                   type="email"
-                  className="input"
-                  placeholder="admin@scriptrunner.internal"
+                  autoComplete="email"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  placeholder="you@example.com"
                   {...registerEmail("email")}
                   aria-invalid={!!emailErrors.email}
-                  style={{ height: 40 }}
+                  style={inputStyle(!!emailErrors.email)}
                 />
-                {emailErrors.email && (
-                  <p style={{ color: "var(--status-error)", fontSize: 11, marginTop: 4 }}>
-                    {emailErrors.email.message}
-                  </p>
-                )}
+                {emailErrors.email && <p style={fieldErrorStyle}>{emailErrors.email.message}</p>}
               </div>
 
               <button
                 type="submit"
                 id="send-email-reset-btn"
-                className="btn btn-primary"
                 disabled={emailSubmitting}
-                style={{ width: "100%", height: 40, marginTop: 4 }}
+                style={submitButtonStyle(emailSubmitting)}
               >
                 {emailSubmitting ? (
                   <>
-                    <Loader2 style={{ width: 14, height: 14 }} className="animate-spin" />
-                    Dispatching Link…
+                    <Loader2 style={{ width: 15, height: 15 }} className="animate-spin" />
+                    Sending…
                   </>
                 ) : (
                   <>
                     <Send style={{ width: 14, height: 14 }} />
-                    Dispatch Recovery Link
+                    Send Reset Link
                   </>
                 )}
               </button>
-            </form>
+            </motion.form>
           )}
-        </div>
-
-        {/* Security Notice */}
-        <p
-          style={{
-            textAlign: "center",
-            fontSize: 11,
-            color: "var(--text-tertiary)",
-            marginTop: 20,
-            lineHeight: 1.5,
-          }}
-        >
-          Recovery requests are rate-limited, logged, and cryptographically verified.
-          <br />
-          Unauthorized access attempts are reported to the security audit console.
-        </p>
+        </AnimatePresence>
       </motion.div>
     </div>
   );
 }
+
+/* ─── Styles ─── */
+
+const pageStyle: React.CSSProperties = {
+  minHeight: "100vh",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  padding: "32px 24px",
+  background: "#0a0a0a",
+  position: "relative",
+  overflow: "hidden",
+};
+
+const noiseStyle: React.CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E")`,
+  backgroundRepeat: "repeat",
+  backgroundSize: "128px 128px",
+  pointerEvents: "none",
+  opacity: 0.6,
+};
+
+const backLinkStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+  fontSize: 13,
+  color: "rgba(255,255,255,0.3)",
+  textDecoration: "none",
+  marginBottom: 28,
+  transition: "color 150ms",
+};
+
+const headingStyle: React.CSSProperties = {
+  fontSize: 28,
+  fontWeight: 700,
+  color: "#ffffff",
+  letterSpacing: "-0.03em",
+  lineHeight: 1.1,
+  marginBottom: 8,
+};
+
+const subheadingStyle: React.CSSProperties = {
+  fontSize: 14,
+  color: "rgba(255,255,255,0.42)",
+  lineHeight: 1.55,
+};
+
+const tabBarStyle: React.CSSProperties = {
+  display: "flex",
+  gap: 2,
+  background: "rgba(255,255,255,0.04)",
+  borderRadius: 9,
+  padding: 3,
+  marginBottom: 24,
+};
+
+const tabButtonStyle = (active: boolean): React.CSSProperties => ({
+  flex: 1,
+  padding: "7px 12px",
+  borderRadius: 6,
+  fontSize: 13,
+  fontWeight: 500,
+  border: "none",
+  cursor: "pointer",
+  background: active ? "rgba(255,255,255,0.1)" : "transparent",
+  color: active ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.35)",
+  transition: "all 150ms",
+  fontFamily: "inherit",
+  letterSpacing: "-0.01em",
+});
+
+const labelStyle: React.CSSProperties = {
+  display: "block",
+  fontSize: 13,
+  fontWeight: 500,
+  color: "rgba(255,255,255,0.65)",
+  marginBottom: 6,
+  letterSpacing: "-0.005em",
+};
+
+const inputStyle = (hasError: boolean): React.CSSProperties => ({
+  width: "100%",
+  height: 42,
+  padding: "0 12px",
+  background: "rgba(255,255,255,0.04)",
+  border: `1px solid ${hasError ? "rgba(248,113,113,0.6)" : "rgba(255,255,255,0.1)"}`,
+  borderRadius: 8,
+  color: "#ffffff",
+  fontSize: 14,
+  outline: "none",
+  transition: "border-color 150ms",
+  fontFamily: "inherit",
+});
+
+const fieldErrorStyle: React.CSSProperties = {
+  color: "#f87171",
+  fontSize: 12,
+  marginTop: 5,
+};
+
+const eyeButtonStyle: React.CSSProperties = {
+  position: "absolute",
+  right: 11,
+  top: "50%",
+  transform: "translateY(-50%)",
+  background: "none",
+  border: "none",
+  color: "rgba(255,255,255,0.35)",
+  cursor: "pointer",
+  padding: 4,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  lineHeight: 1,
+};
+
+const submitButtonStyle = (disabled: boolean): React.CSSProperties => ({
+  width: "100%",
+  height: 42,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 8,
+  background: disabled ? "rgba(255,255,255,0.08)" : "#ffffff",
+  color: disabled ? "rgba(255,255,255,0.35)" : "#000000",
+  border: "none",
+  borderRadius: 8,
+  fontSize: 14,
+  fontWeight: 600,
+  cursor: disabled ? "not-allowed" : "pointer",
+  letterSpacing: "-0.01em",
+  transition: "background 150ms, color 150ms",
+  fontFamily: "inherit",
+  marginTop: 4,
+});
+
+const errorBannerStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 9,
+  padding: "11px 14px",
+  borderRadius: 8,
+  border: "1px solid rgba(248,113,113,0.2)",
+  background: "rgba(248,113,113,0.06)",
+  color: "#f87171",
+  fontSize: 13,
+  lineHeight: 1.4,
+  overflow: "hidden",
+};
+
+const successBannerStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 9,
+  padding: "11px 14px",
+  borderRadius: 8,
+  border: "1px solid rgba(52,211,153,0.2)",
+  background: "rgba(52,211,153,0.06)",
+  color: "#34d399",
+  fontSize: 13,
+  lineHeight: 1.4,
+  overflow: "hidden",
+};
