@@ -85,8 +85,8 @@ public sealed class InstallationForm : Form
 
             if (success)
             {
-                UpdateProgress(100, "Installation complete! Endpoint is registered and online.");
-                await Task.Delay(1400); // Brief visual confirmation
+                UpdateProgress(100, $"Installation complete! {Environment.MachineName} is registered and online.");
+                await Task.Delay(2500); // Visual confirmation
                 Close();
                 Environment.Exit(0);
             }

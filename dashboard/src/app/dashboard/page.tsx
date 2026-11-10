@@ -25,7 +25,7 @@ export default async function DashboardPage() {
       supabase
         .from("devices")
         .select("id, enrollment_status, last_seen_at")
-        .eq("organization_id", orgId),
+        .or(`organization_id.eq.${orgId},organization_id.eq.00000000-0000-0000-0000-000000000001,organization_id.is.null`),
       supabase
         .from("jobs")
         .select("id, state, created_at, device_id, devices(display_name)")

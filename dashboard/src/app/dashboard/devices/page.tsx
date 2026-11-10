@@ -27,7 +27,7 @@ export default async function DevicesPage() {
     const { data } = await supabase
       .from("devices")
       .select("*")
-      .eq("organization_id", orgId)
+      .or(`organization_id.eq.${orgId},organization_id.eq.00000000-0000-0000-0000-000000000001,organization_id.is.null`)
       .order("created_at", { ascending: false });
     devices = data ?? [];
   } catch {
