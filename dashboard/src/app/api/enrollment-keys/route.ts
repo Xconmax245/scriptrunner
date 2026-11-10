@@ -106,6 +106,10 @@ export async function POST(req: NextRequest) {
       ip_address: clientIp(req),
     });
 
+    const reqHost = req.headers.get("x-forwarded-host") || req.headers.get("host") || "scriptrunner-dasboard.vercel.app";
+    const reqProto = req.headers.get("x-forwarded-proto") || (reqHost.includes("localhost") ? "http" : "https");
+    const appUrl = `${reqProto}://${reqHost}`;
+
     return NextResponse.json(
       {
         key: {
@@ -117,9 +121,12 @@ export async function POST(req: NextRequest) {
         },
         // Shown once. Never stored in plaintext and never logged.
         enrollment_key: key,
+        supabase_url: appUrl,
         install_command:
           `powershell -ExecutionPolicy Bypass -File .\\install-service.ps1 ` +
-          `-SupabaseUrl "<your-supabase-url>" -EnrollmentKey "${key}"`,
+          `-SupabaseUrl "${appUrl}" -EnrollmentKey "${key}"`,
+        zero_terminal_note:
+          `Double-click ScriptRunnerAgent.exe to install automatically. No terminal required.`,
       },
       { status: 201 }
     );

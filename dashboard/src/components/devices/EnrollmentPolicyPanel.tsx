@@ -6,6 +6,7 @@ import {
   AlertCircle,
   Check,
   Copy,
+  Download,
   KeyRound,
   Loader2,
   RefreshCw,
@@ -160,6 +161,39 @@ export function EnrollmentPolicyPanel({ organizationId }: Props) {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const downloadConfig = (enrollmentKey: string) => {
+    const config = {
+      ScriptRunner: {
+        SupabaseUrl: typeof window !== "undefined" ? window.location.origin : "https://scriptrunner-dasboard.vercel.app",
+        SupabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVoYmFkZm9wZm9sd3dvb3F6emJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2ODE1NDYsImV4cCI6MjEwODI1NzU0Nn0.3pEWvB4ulsAPt78COTjmqYFSgXWDP_7vbaR4KBu0MJ4",
+        EnrollmentKey: enrollmentKey,
+        DeviceId: "",
+        DeviceApiKey: "",
+        PollIntervalSeconds: 2,
+        MaxBackoffSeconds: 30,
+        HeartbeatIntervalSeconds: 15,
+        EnableRemoteTerminal: true,
+        EnableRmm: true
+      },
+      Logging: {
+        LogLevel: {
+          Default: "Information",
+          "Microsoft.Hosting.Lifetime": "Information",
+          "System.Net.Http.HttpClient": "Warning"
+        }
+      }
+    };
+    const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "appsettings.json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   const close = () => {
     setOpen(false);
     setCreated(null);
@@ -275,6 +309,37 @@ export function EnrollmentPolicyPanel({ organizationId }: Props) {
                       </div>
                     </div>
 
+                    <div
+                      style={{
+                        borderRadius: "var(--radius-md)",
+                        border: "1px solid rgba(56,189,248,0.25)",
+                        background: "rgba(56,189,248,0.06)",
+                        padding: 14,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 10,
+                      }}
+                    >
+                      <div>
+                        <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>
+                          Zero-Terminal Setup (Double-Click Installer)
+                        </p>
+                        <p style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 2, lineHeight: 1.4 }}>
+                          Download this pre-configured <code style={{ color: "var(--accent-primary)" }}>appsettings.json</code> into the same directory as <code style={{ color: "var(--text-primary)" }}>ScriptRunnerAgent.exe</code>. Then simply double-click the EXE on any Windows machine to install automatically. No terminal or PowerShell required.
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => downloadConfig(created.enrollment_key)}
+                        className="btn btn-primary btn-sm"
+                        style={{ alignSelf: "flex-start", gap: 6 }}
+                      >
+                        <Download style={{ width: 13, height: 13 }} />
+                        Download appsettings.json
+                      </button>
+                    </div>
+
                     <div>
                       <p className="label">Cryptographic Organization Key</p>
                       <div style={{ position: "relative" }}>
@@ -292,7 +357,7 @@ export function EnrollmentPolicyPanel({ organizationId }: Props) {
                     </div>
 
                     <div>
-                      <p className="label">Elevated PowerShell One-Liner</p>
+                      <p className="label">Alternative: Elevated PowerShell One-Liner</p>
                       <div style={{ position: "relative" }}>
                         <pre className="code-block" style={{ fontSize: 11, paddingRight: 40, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
                           {created.install_command}

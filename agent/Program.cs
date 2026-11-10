@@ -25,9 +25,13 @@ internal static class Program
     [STAThread]
     private static async Task Main(string[] args)
     {
-        bool isInstallMode = args.Contains("--install", StringComparer.OrdinalIgnoreCase);
+        bool isServiceMode = args.Contains("--service", StringComparer.OrdinalIgnoreCase) ||
+                             WindowsServiceHelpers.IsWindowsService();
+        bool isWorkerMode = args.Contains("--worker", StringComparer.OrdinalIgnoreCase) ||
+                            args.Contains("--console", StringComparer.OrdinalIgnoreCase);
         bool isUninstallMode = args.Contains("--uninstall", StringComparer.OrdinalIgnoreCase);
 
+        // 1. Uninstall mode
         if (isUninstallMode)
         {
             if (!AgentInstaller.IsAdministrator())
@@ -41,91 +45,93 @@ internal static class Program
             return;
         }
 
-        if (isInstallMode)
+        // 2. Service execution mode (Windows Service Control Manager or explicit worker flag)
+        if (isServiceMode || isWorkerMode)
         {
-            if (!AgentInstaller.IsAdministrator())
+            const string MutexName = @"Global\ScriptRunnerAgent_SingleInstance_Mutex";
+            using var singleInstanceMutex = new Mutex(initiallyOwned: true, MutexName, out bool isOnlyInstance);
+            if (!isOnlyInstance && !isServiceMode)
             {
-                AgentInstaller.RelaunchAsAdministrator(args);
+                Console.WriteLine("[ScriptRunnerAgent] Another instance is already running.");
                 return;
             }
 
-            ApplicationConfiguration.Initialize();
-            Application.Run(new InstallationForm());
-            return;
-        }
-
-        // Standard worker execution mode (both interactive console and Windows Service)
-        const string MutexName = @"Global\ScriptRunnerAgent_SingleInstance_Mutex";
-        using var singleInstanceMutex = new Mutex(initiallyOwned: true, MutexName, out bool isOnlyInstance);
-        if (!isOnlyInstance)
-        {
-            Console.WriteLine("[ScriptRunnerAgent] Another instance is already running.");
-            return;
-        }
-
-        var builder = Host.CreateDefaultBuilder(args)
-            .UseContentRoot(AppContext.BaseDirectory)
-            .UseWindowsService(options =>
-            {
-                options.ServiceName = "ScriptRunnerAgent";
-            })
-            .ConfigureServices((hostContext, services) =>
-            {
-                // Bind configuration
-                services.Configure<AgentOptions>(
-                    hostContext.Configuration.GetSection(AgentOptions.SectionName));
-
-                // Typed HTTP client for Supabase Edge Functions
-                services.AddHttpClient<ISupabaseApiClient, SupabaseApiClient>(client =>
+            var builder = Host.CreateDefaultBuilder(args)
+                .UseContentRoot(AppContext.BaseDirectory)
+                .UseWindowsService(options =>
                 {
-                    client.Timeout = TimeSpan.FromSeconds(90);
+                    options.ServiceName = "ScriptRunnerAgent";
+                })
+                .ConfigureServices((hostContext, services) =>
+                {
+                    // Bind configuration
+                    services.Configure<AgentOptions>(
+                        hostContext.Configuration.GetSection(AgentOptions.SectionName));
+
+                    // Typed HTTP client for Supabase / Vercel API Gateway
+                    services.AddHttpClient<ISupabaseApiClient, SupabaseApiClient>(client =>
+                    {
+                        client.Timeout = TimeSpan.FromSeconds(90);
+                    });
+
+                    // Local device identity (self-generated device ID + install ID)
+                    services.AddSingleton<IDeviceIdentityStore, DeviceIdentityStore>();
+
+                    // Automatic enrollment / authorization gate
+                    services.AddSingleton<EnrollmentService>();
+
+                    // Script execution engine & state persistence
+                    services.AddSingleton<IJobExecutionEngine, JobExecutionEngine>();
+                    services.AddSingleton<IStatePersistenceManager, StatePersistenceManager>();
+
+                    // RMM: inventory, telemetry, monitoring, software deployment
+                    services.AddSingleton<AgentRuntimeState>();
+                    services.AddSingleton<InventoryCache>();
+                    services.AddSingleton<HardwareInventoryCollector>();
+                    services.AddSingleton<OperatingSystemInventoryCollector>();
+                    services.AddSingleton<NetworkInventoryCollector>();
+                    services.AddSingleton<SoftwareInventoryCollector>();
+                    services.AddSingleton<SystemMetricsCollector>();
+                    services.AddSingleton<RmmStateStore>();
+                    services.AddSingleton<EventLogScanner>();
+                    services.AddSingleton<MonitorRunner>();
+                    services.AddSingleton<SoftwareDeploymentExecutor>();
+
+                    // Background workers: queued jobs + interactive remote terminal + RMM
+                    services.AddHostedService<AgentWorkerService>();
+                    services.AddHostedService<TerminalWorkerService>();
+                    services.AddHostedService<RmmWorkerService>();
+                })
+                .ConfigureLogging(logging =>
+                {
+                    logging.ClearProviders();
+                    logging.AddConsole();
+
+                    if (WindowsServiceHelpers.IsWindowsService())
+                    {
+                        logging.AddEventLog(settings =>
+                        {
+                            settings.SourceName = "ScriptRunnerAgent";
+                        });
+                    }
+
+                    logging.SetMinimumLevel(LogLevel.Information);
                 });
 
-                // Local device identity (self-generated device ID + install ID)
-                services.AddSingleton<IDeviceIdentityStore, DeviceIdentityStore>();
+            var host = builder.Build();
+            await host.RunAsync();
+            return;
+        }
 
-                // Automatic enrollment / authorization gate
-                services.AddSingleton<EnrollmentService>();
+        // 3. User double-clicked ScriptRunnerAgent.exe in Windows Explorer!
+        // No terminal needed! Auto-elevate with Windows UAC prompt and run the setup GUI.
+        if (!AgentInstaller.IsAdministrator())
+        {
+            AgentInstaller.RelaunchAsAdministrator(args);
+            return;
+        }
 
-                // Script execution engine & state persistence
-                services.AddSingleton<IJobExecutionEngine, JobExecutionEngine>();
-                services.AddSingleton<IStatePersistenceManager, StatePersistenceManager>();
-
-                // RMM: inventory, telemetry, monitoring, software deployment
-                services.AddSingleton<AgentRuntimeState>();
-                services.AddSingleton<InventoryCache>();
-                services.AddSingleton<HardwareInventoryCollector>();
-                services.AddSingleton<OperatingSystemInventoryCollector>();
-                services.AddSingleton<NetworkInventoryCollector>();
-                services.AddSingleton<SoftwareInventoryCollector>();
-                services.AddSingleton<SystemMetricsCollector>();
-                services.AddSingleton<RmmStateStore>();
-                services.AddSingleton<EventLogScanner>();
-                services.AddSingleton<MonitorRunner>();
-                services.AddSingleton<SoftwareDeploymentExecutor>();
-
-                // Background workers: queued jobs + interactive remote terminal + RMM
-                services.AddHostedService<AgentWorkerService>();
-                services.AddHostedService<TerminalWorkerService>();
-                services.AddHostedService<RmmWorkerService>();
-            })
-            .ConfigureLogging(logging =>
-            {
-                logging.ClearProviders();
-                logging.AddConsole();
-
-                if (WindowsServiceHelpers.IsWindowsService())
-                {
-                    logging.AddEventLog(settings =>
-                    {
-                        settings.SourceName = "ScriptRunnerAgent";
-                    });
-                }
-
-                logging.SetMinimumLevel(LogLevel.Information);
-            });
-
-        var host = builder.Build();
-        await host.RunAsync();
+        ApplicationConfiguration.Initialize();
+        Application.Run(new InstallationForm());
     }
 }

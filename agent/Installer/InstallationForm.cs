@@ -15,42 +15,42 @@ public sealed class InstallationForm : Form
     public InstallationForm()
     {
         Text = "ScriptRunner Endpoint Setup";
-        ClientSize = new Size(500, 200);
+        ClientSize = new Size(520, 210);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        BackColor = Color.FromArgb(24, 24, 27);
+        BackColor = Color.FromArgb(10, 10, 12);
         ForeColor = Color.FromArgb(244, 244, 245);
         Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
 
         // Header label
         _headerLabel = new Label
         {
-            Text = "Installing ScriptRunner Endpoint Agent",
+            Text = "ScriptRunner Endpoint Agent",
             Font = new Font("Segoe UI", 12F, FontStyle.Bold, GraphicsUnit.Point),
-            ForeColor = Color.FromArgb(250, 250, 250),
+            ForeColor = Color.FromArgb(255, 255, 255),
             Location = new Point(28, 24),
-            Size = new Size(440, 28),
+            Size = new Size(464, 28),
             AutoEllipsis = true
         };
 
         // Subtitle label
         _subtitleLabel = new Label
         {
-            Text = "Configuring secure background service and endpoint connectivity...",
+            Text = "Installing background service and connecting to ScriptRunner Dashboard...",
             Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point),
             ForeColor = Color.FromArgb(161, 161, 170),
             Location = new Point(28, 54),
-            Size = new Size(440, 20),
+            Size = new Size(464, 20),
             AutoEllipsis = true
         };
 
         // Progress bar
         _progressBar = new ProgressBar
         {
-            Location = new Point(28, 88),
-            Size = new Size(444, 20),
+            Location = new Point(28, 90),
+            Size = new Size(464, 20),
             Minimum = 0,
             Maximum = 100,
             Value = 5,
@@ -60,11 +60,11 @@ public sealed class InstallationForm : Form
         // Status step label
         _statusLabel = new Label
         {
-            Text = "Initializing installation...",
+            Text = "Starting zero-touch installation...",
             Font = new Font("Segoe UI", 8.5F, FontStyle.Regular, GraphicsUnit.Point),
             ForeColor = Color.FromArgb(212, 212, 216),
-            Location = new Point(28, 120),
-            Size = new Size(444, 40),
+            Location = new Point(28, 122),
+            Size = new Size(464, 40),
             AutoEllipsis = true
         };
 
@@ -80,19 +80,19 @@ public sealed class InstallationForm : Form
     {
         try
         {
-            await Task.Delay(300); // Smooth initial transition
+            await Task.Delay(400); // Visual readiness
             bool success = await AgentInstaller.InstallAsync(UpdateProgress);
 
             if (success)
             {
-                UpdateProgress(100, "Installation complete.");
-                await Task.Delay(500); // Brief visual confirmation at 100%
+                UpdateProgress(100, "Installation complete! Endpoint is registered and online.");
+                await Task.Delay(1400); // Brief visual confirmation
                 Close();
                 Environment.Exit(0);
             }
             else
             {
-                UpdateProgress(_progressBar.Value, "Installation failed. Check system permissions.");
+                UpdateProgress(_progressBar.Value, "Installation failed. Please verify administrative privileges.");
             }
         }
         catch (Exception ex)

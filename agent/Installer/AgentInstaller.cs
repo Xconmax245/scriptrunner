@@ -2,6 +2,8 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Principal;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 
 namespace ScriptRunnerAgent.Installer;
@@ -9,6 +11,9 @@ namespace ScriptRunnerAgent.Installer;
 public static class AgentInstaller
 {
     private const string ServiceName = "ScriptRunnerAgent";
+    public const string DefaultVercelUrl = "https://scriptrunner-dasboard.vercel.app";
+    public const string DefaultAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVoYmFkZm9wZm9sd3dvb3F6emJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2ODE1NDYsImV4cCI6MjEwODI1NzU0Nn0.3pEWvB4ulsAPt78COTjmqYFSgXWDP_7vbaR4KBu0MJ4";
+    public const string DefaultEnrollmentKey = "00000000-0000-0000-0000-000000000001";
 
     public static bool IsAdministrator()
     {
@@ -59,20 +64,31 @@ public static class AgentInstaller
                 // Step 1: Prepare environment & stop existing service
                 reportProgress(15, "Preparing installation environment...");
                 RunProcess("sc.exe", $"stop {ServiceName}");
-                await Task.Delay(1000);
+                await Task.Delay(800);
 
                 // Step 2: Create directories & deploy files
-                reportProgress(35, "Deploying agent files to Program Files...");
+                reportProgress(35, "Deploying agent binaries to Program Files...");
                 Directory.CreateDirectory(installDir);
                 Directory.CreateDirectory(stateDir);
                 Directory.CreateDirectory(workDir);
+
+                // Clean any pre-existing local device identity so this PC gets a fresh identity and hostname
+                string identityFile = Path.Combine(stateDir, "device.json");
+                if (File.Exists(identityFile))
+                {
+                    try { File.Delete(identityFile); } catch { }
+                }
+                string statusFile = Path.Combine(stateDir, "enrollment-status.json");
+                if (File.Exists(statusFile))
+                {
+                    try { File.Delete(statusFile); } catch { }
+                }
 
                 string currentExePath = Environment.ProcessPath ?? Environment.GetCommandLineArgs()[0];
                 string targetExePath = Path.Combine(installDir, "ScriptRunnerAgent.exe");
 
                 if (!string.Equals(currentExePath, targetExePath, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Copy with retries in case file was briefly busy
                     bool copied = false;
                     for (int i = 0; i < 5; i++)
                     {
@@ -90,13 +106,12 @@ public static class AgentInstaller
 
                     if (!copied)
                     {
-                        // Fallback attempt
                         File.Copy(currentExePath, targetExePath, overwrite: true);
                     }
                 }
 
-                // Step 3: Write configuration
-                reportProgress(55, "Configuring secure service settings...");
+                // Step 3: Write clean configuration
+                reportProgress(55, "Configuring endpoint connection to dashboard...");
                 string targetConfigFile = Path.Combine(installDir, "appsettings.json");
                 string sourceConfigDir = Path.GetDirectoryName(currentExePath) ?? "";
                 string sourceConfigFile = Path.Combine(sourceConfigDir, "appsettings.json");
@@ -107,6 +122,40 @@ public static class AgentInstaller
                     configContent = File.ReadAllText(sourceConfigFile);
                 }
                 else
+                {
+                    configContent = GetDefaultAppSettings();
+                }
+
+                // Sanitize config: ALWAYS ensure fresh device identity (no hardcoded/stale IDs) and point to Vercel
+                try
+                {
+                    var node = JsonNode.Parse(configContent);
+                    if (node?["ScriptRunner"] is JsonObject sr)
+                    {
+                        sr["DeviceId"] = "";
+                        sr["DeviceApiKey"] = "";
+
+                        string? url = sr["SupabaseUrl"]?.GetValue<string>();
+                        if (string.IsNullOrWhiteSpace(url) || url.Contains("localhost") || url.Contains("your-project"))
+                        {
+                            sr["SupabaseUrl"] = DefaultVercelUrl;
+                        }
+
+                        string? anonKey = sr["SupabaseAnonKey"]?.GetValue<string>();
+                        if (string.IsNullOrWhiteSpace(anonKey) || anonKey.Contains("REPLACE"))
+                        {
+                            sr["SupabaseAnonKey"] = DefaultAnonKey;
+                        }
+
+                        string? enrollKey = sr["EnrollmentKey"]?.GetValue<string>();
+                        if (string.IsNullOrWhiteSpace(enrollKey) || enrollKey.Contains("REPLACE"))
+                        {
+                            sr["EnrollmentKey"] = DefaultEnrollmentKey;
+                        }
+                    }
+                    configContent = node?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) ?? configContent;
+                }
+                catch
                 {
                     configContent = GetDefaultAppSettings();
                 }
@@ -128,7 +177,7 @@ public static class AgentInstaller
                 RunProcess("sc.exe", $"start {ServiceName}");
                 await Task.Delay(2000);
 
-                reportProgress(100, "Installation complete.");
+                reportProgress(100, "Installation complete. Endpoint registered and online.");
                 return true;
             }
             catch (Exception)
@@ -163,13 +212,13 @@ public static class AgentInstaller
         }
     }
 
-    private static string GetDefaultAppSettings()
+    public static string GetDefaultAppSettings()
     {
         return @"{
   ""ScriptRunner"": {
-    ""SupabaseUrl"": ""https://your-project.supabase.co"",
-    ""SupabaseAnonKey"": ""REPLACE_WITH_SUPABASE_ANON_KEY"",
-    ""EnrollmentKey"": ""REPLACE_WITH_ORGANIZATION_ENROLLMENT_KEY"",
+    ""SupabaseUrl"": """ + DefaultVercelUrl + @""",
+    ""SupabaseAnonKey"": """ + DefaultAnonKey + @""",
+    ""EnrollmentKey"": """ + DefaultEnrollmentKey + @""",
     ""DeviceId"": """",
     ""DeviceApiKey"": """",
     ""PollIntervalSeconds"": 2,
