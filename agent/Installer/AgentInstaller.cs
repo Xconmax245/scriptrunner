@@ -9,6 +9,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 
 namespace ScriptRunnerAgent.Installer;
 
@@ -19,19 +20,33 @@ public static class AgentInstaller
     public const string DefaultAnonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVoYmFkZm9wZm9sd3dvb3F6emJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2ODE1NDYsImV4cCI6MjEwODI1NzU0Nn0.3pEWvB4ulsAPt78COTjmqYFSgXWDP_7vbaR4KBu0MJ4";
     public const string DefaultEnrollmentKey = "00000000-0000-0000-0000-000000000001";
 
-    private static readonly string LogFilePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-        "ScriptRunnerAgent",
-        "installer.log");
+    public static string GetLogPath()
+    {
+        try
+        {
+            string common = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "ScriptRunnerAgent");
+            Directory.CreateDirectory(common);
+            return Path.Combine(common, "installer.log");
+        }
+        catch
+        {
+            string local = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "ScriptRunnerAgent");
+            Directory.CreateDirectory(local);
+            return Path.Combine(local, "installer.log");
+        }
+    }
 
     public static void Log(string message)
     {
         try
         {
-            string dir = Path.GetDirectoryName(LogFilePath)!;
-            Directory.CreateDirectory(dir);
+            string path = GetLogPath();
             string line = $"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fffZ}] {message}{Environment.NewLine}";
-            File.AppendAllText(LogFilePath, line);
+            File.AppendAllText(path, line);
             Console.WriteLine($"[Installer] {message}");
         }
         catch
@@ -54,7 +69,7 @@ public static class AgentInstaller
         }
     }
 
-    public static void RelaunchAsAdministrator(string[] args)
+    public static bool RelaunchAsAdministrator(string[] args)
     {
         try
         {
@@ -65,11 +80,13 @@ public static class AgentInstaller
                 Verb = "runas",
                 Arguments = string.Join(" ", args)
             };
-            Process.Start(psi);
+            var proc = Process.Start(psi);
+            return proc != null;
         }
         catch (Exception ex)
         {
-            Log($"UAC elevation was cancelled or failed: {ex.Message}");
+            Log($"UAC elevation was declined or unavailable: {ex.Message}. Continuing in user-level mode.");
+            return false;
         }
     }
 
@@ -86,7 +103,7 @@ public static class AgentInstaller
                     {
                         proc.Kill(entireProcessTree: true);
                         proc.WaitForExit(2000);
-                        Log($"Terminated existing process {proc.Id}");
+                        Log($"Terminated background process {proc.Id}");
                     }
                     catch
                     {
@@ -107,13 +124,26 @@ public static class AgentInstaller
         {
             try
             {
-                Log("=== Starting zero-terminal agent installation ===");
-                string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-                string programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+                bool isAdmin = IsAdministrator();
+                Log($"=== Starting zero-terminal agent installation (Admin={isAdmin}) ===");
 
-                string installDir = Path.Combine(programFiles, "ScriptRunnerAgent");
-                string stateDir = Path.Combine(programData, "ScriptRunnerAgent", "state");
-                string workDir = Path.Combine(programData, "ScriptRunnerAgent", "work");
+                string installDir;
+                string stateDir;
+                string workDir;
+
+                if (isAdmin)
+                {
+                    installDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ScriptRunnerAgent");
+                    stateDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ScriptRunnerAgent", "state");
+                    workDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ScriptRunnerAgent", "work");
+                }
+                else
+                {
+                    string localApp = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                    installDir = Path.Combine(localApp, "ScriptRunnerAgent");
+                    stateDir = Path.Combine(localApp, "ScriptRunnerAgent", "state");
+                    workDir = Path.Combine(localApp, "ScriptRunnerAgent", "work");
+                }
 
                 // Step 1: Prepare environment & stop existing service
                 reportProgress(10, "Preparing installation environment...");
@@ -122,8 +152,10 @@ public static class AgentInstaller
                 Directory.CreateDirectory(stateDir);
                 Directory.CreateDirectory(workDir);
 
-                // Stop service if running and kill background agent processes
-                RunCommand("sc.exe", $"stop {ServiceName}");
+                if (isAdmin)
+                {
+                    RunCommand("sc.exe", $"stop {ServiceName}");
+                }
                 KillOtherAgentProcesses();
                 await Task.Delay(500);
 
@@ -139,8 +171,18 @@ public static class AgentInstaller
                     try { File.Delete(statusFile); } catch { }
                 }
 
+                // Also clean CommonApplicationData state if running in user mode, just in case
+                try
+                {
+                    string commonId = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                        "ScriptRunnerAgent", "state", "device.json");
+                    if (File.Exists(commonId)) File.Delete(commonId);
+                }
+                catch { }
+
                 // Step 2: Deploy executable
-                reportProgress(25, "Deploying agent binaries to Program Files...");
+                reportProgress(25, "Deploying agent binaries...");
                 string currentExePath = Environment.ProcessPath ?? Environment.GetCommandLineArgs()[0];
                 string targetExePath = Path.Combine(installDir, "ScriptRunnerAgent.exe");
 
@@ -197,6 +239,7 @@ public static class AgentInstaller
                     {
                         sr["DeviceId"] = "";
                         sr["DeviceApiKey"] = "";
+                        sr["LocalStateDirectory"] = stateDir;
 
                         string? url = sr["SupabaseUrl"]?.GetValue<string>();
                         if (!string.IsNullOrWhiteSpace(url) && !url.Contains("localhost") && !url.Contains("your-project"))
@@ -248,7 +291,7 @@ public static class AgentInstaller
                 if (enrolled && !string.IsNullOrEmpty(deviceId) && !string.IsNullOrEmpty(apiKey))
                 {
                     Log($"Direct enrollment succeeded: DeviceId={deviceId}, OrgId={orgId}");
-                    // Persist credentials to state/device.json
+                    
                     var identityJson = new JsonObject
                     {
                         ["device_id"] = deviceId,
@@ -259,7 +302,8 @@ public static class AgentInstaller
                         ["created_at"] = DateTimeOffset.UtcNow.ToString("o"),
                         ["enrolled_at"] = DateTimeOffset.UtcNow.ToString("o")
                     };
-                    File.WriteAllText(identityFile, identityJson.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                    string idText = identityJson.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+                    File.WriteAllText(identityFile, idText);
 
                     var statusJson = new JsonObject
                     {
@@ -268,7 +312,21 @@ public static class AgentInstaller
                         ["error"] = null,
                         ["updated_at"] = DateTimeOffset.UtcNow.ToString("o")
                     };
-                    File.WriteAllText(statusFile, statusJson.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                    string stText = statusJson.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+                    File.WriteAllText(statusFile, stText);
+
+                    // If admin, also mirror to CommonApplicationData
+                    if (isAdmin)
+                    {
+                        try
+                        {
+                            string commonDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "ScriptRunnerAgent", "state");
+                            Directory.CreateDirectory(commonDir);
+                            File.WriteAllText(Path.Combine(commonDir, "device.json"), idText);
+                            File.WriteAllText(Path.Combine(commonDir, "enrollment-status.json"), stText);
+                        }
+                        catch { }
+                    }
 
                     reportProgress(70, $"Device {Environment.MachineName} registered successfully!");
 
@@ -277,17 +335,23 @@ public static class AgentInstaller
                 }
                 else
                 {
-                    Log("Direct enrollment call did not complete synchronously. Service will enroll on startup.");
+                    Log("Direct enrollment call did not complete synchronously. Background worker will enroll on startup.");
                 }
 
-                // Step 5: Register and start Windows Service
-                reportProgress(80, "Configuring background Windows Service...");
-                bool serviceStarted = RegisterAndStartService(targetExePath);
+                // Step 5: Start background worker / Windows Service
+                reportProgress(85, "Configuring background service...");
 
-                if (!serviceStarted)
+                bool serviceRunning = false;
+                if (isAdmin)
                 {
-                    Log("Service start via SCM returned false. Starting worker in background as resilient fallback...");
-                    StartWorkerFallback(targetExePath);
+                    serviceRunning = RegisterAndStartService(targetExePath);
+                }
+
+                if (!serviceRunning)
+                {
+                    Log("Setting up background auto-start via Registry & Task, and spawning worker...");
+                    RegisterUserAutoStart(targetExePath);
+                    StartWorkerDetached(targetExePath);
                 }
 
                 reportProgress(100, $"Installation complete! {Environment.MachineName} is online on the dashboard.");
@@ -378,7 +442,7 @@ public static class AgentInstaller
                 agent_version = "1.0.0",
                 operating_system = RuntimeInformation.OSDescription.Trim(),
                 service_status = "running",
-                is_elevated = true
+                is_elevated = IsAdministrator()
             };
             await client.PostAsJsonAsync(gatewayEndpoint, hbPayload);
             Log("Initial live heartbeat dispatched successfully.");
@@ -472,16 +536,35 @@ try {{
         return false;
     }
 
-    private static void StartWorkerFallback(string targetExePath)
+    private static void RegisterUserAutoStart(string targetExePath)
     {
         try
         {
-            Log("Creating startup scheduled task and launching background worker process...");
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", writable: true);
+            if (key != null)
+            {
+                string cmd = $"\"{targetExePath}\" --worker";
+                key.SetValue("ScriptRunnerAgent", cmd);
+                Log("Registered auto-start in HKCU Run key.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"RegisterUserAutoStart HKCU Run error: {ex.Message}");
+        }
 
-            // Register scheduled task so worker starts on boot even without service privileges
-            RunCommand("schtasks.exe", $"/create /tn \"{ServiceName}\" /tr \"\\\"{targetExePath}\\\" --worker\" /sc onstart /ru \"SYSTEM\" /f");
+        // Also try scheduled task (both elevated and standard user support)
+        try
+        {
+            RunCommand("schtasks.exe", $"/create /tn \"{ServiceName}\" /tr \"\\\"{targetExePath}\\\" --worker\" /sc onlogon /f");
+        }
+        catch { }
+    }
 
-            // Launch detached worker immediately
+    private static void StartWorkerDetached(string targetExePath)
+    {
+        try
+        {
             var psi = new ProcessStartInfo
             {
                 FileName = targetExePath,
@@ -492,11 +575,11 @@ try {{
                 WorkingDirectory = Path.GetDirectoryName(targetExePath)
             };
             Process.Start(psi);
-            Log("Background worker process spawned successfully.");
+            Log("Detached background worker process spawned successfully.");
         }
         catch (Exception ex)
         {
-            Log($"StartWorkerFallback exception: {ex.Message}");
+            Log($"StartWorkerDetached exception: {ex.Message}");
         }
     }
 

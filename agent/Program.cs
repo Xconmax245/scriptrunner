@@ -25,6 +25,13 @@ internal static class Program
     [STAThread]
     private static async Task Main(string[] args)
     {
+        try
+        {
+            string debugPath = Path.Combine(AppContext.BaseDirectory, "agent-debug.log");
+            File.AppendAllText(debugPath, $"[{DateTime.UtcNow:o}] Main started. IsAdmin={AgentInstaller.IsAdministrator()}, Args={string.Join(" ", args)}{Environment.NewLine}");
+        }
+        catch { }
+
         bool isServiceMode = args.Contains("--service", StringComparer.OrdinalIgnoreCase) ||
                              WindowsServiceHelpers.IsWindowsService();
         bool isWorkerMode = args.Contains("--worker", StringComparer.OrdinalIgnoreCase) ||
@@ -50,10 +57,12 @@ internal static class Program
                                args.Contains("/silent", StringComparer.OrdinalIgnoreCase);
         if (isSilentInstall)
         {
-            if (!AgentInstaller.IsAdministrator())
+            if (!AgentInstaller.IsAdministrator() && !args.Contains("--user-mode", StringComparer.OrdinalIgnoreCase))
             {
-                AgentInstaller.RelaunchAsAdministrator(args);
-                return;
+                if (AgentInstaller.RelaunchAsAdministrator(args))
+                {
+                    return;
+                }
             }
 
             bool ok = await AgentInstaller.InstallAsync((p, msg) => Console.WriteLine($"[{p}%] {msg}"));
@@ -141,10 +150,12 @@ internal static class Program
 
         // 3. User double-clicked ScriptRunnerAgent.exe in Windows Explorer!
         // No terminal needed! Auto-elevate with Windows UAC prompt and run the setup GUI.
-        if (!AgentInstaller.IsAdministrator())
+        if (!AgentInstaller.IsAdministrator() && !args.Contains("--user-mode", StringComparer.OrdinalIgnoreCase))
         {
-            AgentInstaller.RelaunchAsAdministrator(args);
-            return;
+            if (AgentInstaller.RelaunchAsAdministrator(args))
+            {
+                return;
+            }
         }
 
         ApplicationConfiguration.Initialize();
