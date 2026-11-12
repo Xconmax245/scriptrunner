@@ -45,6 +45,22 @@ internal static class Program
             return;
         }
 
+        // 1b. Silent install mode (for scripts / headless deployment)
+        bool isSilentInstall = args.Contains("--silent-install", StringComparer.OrdinalIgnoreCase) ||
+                               args.Contains("/silent", StringComparer.OrdinalIgnoreCase);
+        if (isSilentInstall)
+        {
+            if (!AgentInstaller.IsAdministrator())
+            {
+                AgentInstaller.RelaunchAsAdministrator(args);
+                return;
+            }
+
+            bool ok = await AgentInstaller.InstallAsync((p, msg) => Console.WriteLine($"[{p}%] {msg}"));
+            Environment.Exit(ok ? 0 : 1);
+            return;
+        }
+
         // 2. Service execution mode (Windows Service Control Manager or explicit worker flag)
         if (isServiceMode || isWorkerMode)
         {
